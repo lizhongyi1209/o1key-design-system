@@ -1,0 +1,233 @@
+/* o1key Design System — Colors & Type
+ * --------------------------------------------------
+ * Anime/techwear aesthetic. Black on cream base, electric
+ * orange as hero accent, teal as the rare-gem highlight.
+ *
+ * Fonts are loaded from Google Fonts (no font files were
+ * provided by the brand). Substitutions:
+ *   Display  → Space Grotesk (geometric, slightly off-kilter)
+ *   Mono     → JetBrains Mono (technical, serial-number feel)
+ *   Body     → Inter Tight (neutral, dense)
+ * If/when real font files are provided, swap @import for
+ * a local @font-face block in fonts/ and update --font-*.
+ */
+
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Inter+Tight:wght@400;500;600;700&display=swap');
+
+:root {
+  /* ---------- COLOR — RAW PALETTE ---------- */
+
+  /* Ink — the bones of every layout. */
+  --ink-1000: #0A0908;   /* near-black, page bg in dark mode */
+  --ink-900:  #14110F;   /* card bg in dark mode */
+  --ink-800:  #1F1B17;   /* raised surface */
+  --ink-700:  #2A2520;   /* hairline / divider on dark */
+  --ink-500:  #6B6259;   /* muted text on cream */
+  --ink-300:  #B8AFA3;   /* disabled / placeholder */
+
+  /* Cream — the page in light mode. Warm, not white. */
+  --cream-50:  #FAF6EE;  /* page bg */
+  --cream-100: #F2EBDD;  /* surface */
+  --cream-200: #E6DCC7;  /* hairline / divider on cream */
+  --cream-300: #D4C7AB;  /* muted illustration fill */
+
+  /* Hero — orange. Used sparingly, never more than ~10% of a frame. */
+  --orange-500: #FF5A1F; /* primary accent — the JONY orange */
+  --orange-600: #E64A12; /* press / hover-darker */
+  --orange-300: #FF8A5F; /* hover-lighter / focus ring */
+  --orange-100: #FFE2D3; /* tint background */
+
+  /* Gem — teal. Used VERY rarely, like the earring. ~1-2 spots per page. */
+  --teal-500: #1FBFA8;
+  --teal-600: #0E9F8B;
+  --teal-100: #C7EDE6;
+
+  /* Functional */
+  --green-500: #6BB04A;
+  --red-500:   #E5484D;
+  --yellow-500:#F2B33D;
+
+  /* ---------- COLOR — SEMANTIC ---------- */
+
+  /* Foreground */
+  --fg-1: var(--ink-1000); /* primary text */
+  --fg-2: var(--ink-500);  /* secondary text */
+  --fg-3: var(--ink-300);  /* tertiary / placeholder */
+  --fg-on-ink:    var(--cream-50);
+  --fg-on-orange: var(--ink-1000);
+
+  /* Background */
+  --bg-page:    var(--cream-50);
+  --bg-surface: var(--cream-100);
+  --bg-raised:  #FFFFFF;
+  --bg-ink:     var(--ink-1000);
+
+  /* Lines */
+  --line-1: var(--cream-200);
+  --line-2: var(--ink-700);
+  --line-strong: var(--ink-1000);
+
+  /* Accents */
+  --accent:        var(--orange-500);
+  --accent-hover:  var(--orange-600);
+  --accent-tint:   var(--orange-100);
+  --gem:           var(--teal-500);
+  --gem-tint:      var(--teal-100);
+
+  /* States */
+  --focus-ring: var(--orange-300);
+  --selection:  var(--orange-100);
+
+  /* ---------- TYPE — RAW ---------- */
+  --font-display: "Space Grotesk", "Helvetica Neue", system-ui, sans-serif;
+  --font-body:    "Inter Tight", "Inter", system-ui, sans-serif;
+  --font-mono:    "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  --fs-12: 12px;
+  --fs-14: 14px;
+  --fs-16: 16px;
+  --fs-18: 18px;
+  --fs-20: 20px;
+  --fs-24: 24px;
+  --fs-32: 32px;
+  --fs-40: 40px;
+  --fs-56: 56px;
+  --fs-72: 72px;
+  --fs-96: 96px;
+
+  --lh-tight:  1.05;
+  --lh-snug:   1.15;
+  --lh-normal: 1.4;
+  --lh-loose:  1.6;
+
+  --tracking-tightest: -0.04em;
+  --tracking-tight:    -0.02em;
+  --tracking-normal:   0;
+  --tracking-wide:     0.04em;
+  --tracking-widest:   0.16em; /* for ALL-CAPS eyebrows */
+
+  /* ---------- SPACING / RADII / SHADOW ---------- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+  --space-8: 64px;
+  --space-9: 96px;
+
+  /* Sharp by default. Techwear doesn't pillow. */
+  --radius-0: 0;
+  --radius-1: 2px;
+  --radius-2: 4px;
+  --radius-3: 8px;        /* the most we ever round; use sparingly */
+  --radius-pill: 999px;   /* only for tags & status pills */
+
+  /* Borders are HEAVY and present. */
+  --border-hairline: 1px;
+  --border-default:  1.5px;
+  --border-bold:     2px;
+  --border-heavy:    3px;
+
+  /* Shadows are TIGHT, not bloomy. Often a hard offset. */
+  --shadow-pop:  3px 3px 0 0 var(--ink-1000); /* hard offset — signature */
+  --shadow-pop-orange: 3px 3px 0 0 var(--orange-500);
+  --shadow-soft: 0 1px 2px rgba(10,9,8,0.08), 0 4px 12px rgba(10,9,8,0.06);
+  --shadow-lift: 0 8px 24px rgba(10,9,8,0.12);
+}
+
+/* ---------- TYPE — SEMANTIC ELEMENTS ---------- */
+
+.h-display {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: clamp(56px, 9vw, 96px);
+  line-height: var(--lh-tight);
+  letter-spacing: var(--tracking-tightest);
+  color: var(--fg-1);
+}
+.h1 {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: var(--fs-56);
+  line-height: var(--lh-tight);
+  letter-spacing: var(--tracking-tight);
+  color: var(--fg-1);
+}
+.h2 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: var(--fs-40);
+  line-height: var(--lh-snug);
+  letter-spacing: var(--tracking-tight);
+  color: var(--fg-1);
+}
+.h3 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: var(--fs-24);
+  line-height: var(--lh-snug);
+  letter-spacing: var(--tracking-tight);
+  color: var(--fg-1);
+}
+.h4 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: var(--fs-20);
+  line-height: var(--lh-snug);
+  letter-spacing: var(--tracking-normal);
+  color: var(--fg-1);
+}
+.eyebrow {
+  font-family: var(--font-mono);
+  font-weight: 500;
+  font-size: var(--fs-12);
+  line-height: 1;
+  letter-spacing: var(--tracking-widest);
+  text-transform: uppercase;
+  color: var(--fg-2);
+}
+.p, p {
+  font-family: var(--font-body);
+  font-weight: 400;
+  font-size: var(--fs-16);
+  line-height: var(--lh-normal);
+  color: var(--fg-1);
+}
+.p-lead {
+  font-family: var(--font-body);
+  font-weight: 400;
+  font-size: var(--fs-20);
+  line-height: var(--lh-normal);
+  color: var(--fg-1);
+}
+.p-small {
+  font-family: var(--font-body);
+  font-weight: 400;
+  font-size: var(--fs-14);
+  line-height: var(--lh-normal);
+  color: var(--fg-2);
+}
+.code, code {
+  font-family: var(--font-mono);
+  font-weight: 500;
+  font-size: 0.92em;
+  letter-spacing: 0;
+  color: var(--fg-1);
+  background: var(--cream-100);
+  padding: 0.1em 0.35em;
+  border: var(--border-hairline) solid var(--line-1);
+  border-radius: var(--radius-1);
+}
+.serial {
+  /* Mono w/ wide tracking. Used as serial-number labels. */
+  font-family: var(--font-mono);
+  font-weight: 500;
+  font-size: var(--fs-12);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+  color: var(--fg-2);
+}
+
+::selection { background: var(--selection); color: var(--fg-1); }

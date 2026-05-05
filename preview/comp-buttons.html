@@ -1,0 +1,25 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="../colors_and_type.css">
+<style>
+  html,body{margin:0;background:var(--bg-page);color:var(--fg-1);font-family:var(--font-body);}
+  .card{padding:24px;}
+  .label{font-family:var(--font-mono);font-size:10px;letter-spacing:0.16em;text-transform:uppercase;color:var(--fg-2);margin-bottom:18px;}
+  .row{display:flex;gap:14px;align-items:center;flex-wrap:wrap;}
+  .btn{font-family:var(--font-display);font-weight:600;font-size:14px;letter-spacing:-0.01em;padding:12px 20px;border:2px solid var(--ink-1000);cursor:pointer;display:inline-flex;align-items:center;gap:8px;}
+  .btn-primary{background:var(--ink-1000);color:var(--cream-50);box-shadow:3px 3px 0 0 var(--orange-500);}
+  .btn-secondary{background:var(--cream-50);color:var(--ink-1000);}
+  .btn-accent{background:var(--orange-500);color:var(--ink-1000);border-color:var(--ink-1000);box-shadow:3px 3px 0 0 var(--ink-1000);}
+  .btn-ghost{background:transparent;color:var(--ink-1000);border:none;text-decoration:underline;text-underline-offset:4px;text-decoration-thickness:2px;text-decoration-color:var(--orange-500);}
+  .arrow{font-family:var(--font-mono);font-weight:700;}
+</style></head>
+<body>
+<div class="card">
+  <div class="label">Buttons</div>
+  <div class="row">
+    <button class="btn btn-primary">Get the key <span class="arrow">→</span></button>
+    <button class="btn btn-accent">Drop in</button>
+    <button class="btn btn-secondary">Read docs</button>
+    <button class="btn btn-ghost">Skip</button>
+  </div>
+</div>
+</body></html>

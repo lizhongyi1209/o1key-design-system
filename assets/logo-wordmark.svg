@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 280 80" width="280" height="80">
+  
+  <text x="0" y="62" class="w" fill="#0A0908">o</text>
+  <text x="38" y="62" class="w" fill="#FF5A1F">1</text>
+  <text x="68" y="62" class="w" fill="#0A0908">key</text>
+  <rect x="218" y="50" width="12" height="12" fill="#FF5A1F"></rect>
+</svg>

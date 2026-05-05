@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>o1key — UI Kit</title>
+<link rel="stylesheet" href="../../colors_and_type.css" />
+<style>
+  html,body{margin:0;background:#FAF6EE;color:#0A0908;}
+  *{box-sizing:border-box;}
+  #root{min-height:100vh;}
+  /* Marquee strip */
+  .marq{background:#0A0908;color:#FAF6EE;border-top:1.5px solid #0A0908;border-bottom:1.5px solid #0A0908;overflow:hidden;}
+  .marq-track{display:flex;gap:48px;padding:14px 0;font-family:"JetBrains Mono",monospace;font-size:13px;letter-spacing:0.16em;text-transform:uppercase;white-space:nowrap;animation:marq 30s linear infinite;}
+  .marq-track span{display:inline-flex;align-items:center;gap:48px;}
+  .marq-track .x{color:#FF5A1F;}
+  @keyframes marq { from{transform:translateX(0)} to{transform:translateX(-50%)} }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+<script type="text/babel" src="Nav.jsx"></script>
+<script type="text/babel" src="Hero.jsx"></script>
+<script type="text/babel" src="FeatureGrid.jsx"></script>
+<script type="text/babel" src="CodeBlock.jsx"></script>
+<script type="text/babel" src="Pricing.jsx"></script>
+<script type="text/babel" src="Footer.jsx"></script>
+
+<script type="text/babel">
+function Marquee() {
+  const items = ["EDGE KEYS", "ZERO COLD START", "P95 · 12MS", "14 REGIONS", "SOC 2 TYPE II", "AUDIT-READY", "DROP-IN", "SHIP-READY"];
+  const row = items.map((t, i) => (<React.Fragment key={i}><span>{t}</span><span className="x">×</span></React.Fragment>));
+  return (
+    <div className="marq" data-screen-label="Marquee">
+      <div className="marq-track">
+        <span>{row}</span><span>{row}</span>
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  return (
+    <div data-screen-label="01 o1key Marketing Site">
+      <Nav />
+      <Hero />
+      <Marquee />
+      <FeatureGrid />
+      <CodeBlock />
+      <Pricing />
+      <Footer />
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>

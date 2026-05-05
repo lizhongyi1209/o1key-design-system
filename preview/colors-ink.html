@@ -1,0 +1,26 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="../colors_and_type.css">
+<style>
+  html,body{margin:0;background:#FFFFFF;color:var(--fg-1);font-family:var(--font-body);}
+  .card{padding:20px;background:#FFFFFF;}
+  .row{display:flex;gap:0;align-items:stretch;border:var(--border-default) solid var(--line-strong);background:#FFFFFF;}
+  .sw{flex:1;height:96px;display:flex;flex-direction:column;justify-content:flex-end;padding:10px;border-right:var(--border-default) solid var(--line-strong);background:#FFFFFF;color:#0A0908;position:relative;}
+  .sw:last-child{border-right:0;}
+  .sw .chip{position:absolute;top:10px;left:10px;width:22px;height:22px;border:1.5px solid #0A0908;}
+  .sw .name{font-family:var(--font-mono);font-size:10px;letter-spacing:0.08em;text-transform:uppercase;color:#0A0908;}
+  .sw .hex{font-family:var(--font-mono);font-size:11px;color:#6B6259;}
+  .label{font-family:var(--font-mono);font-size:10px;letter-spacing:0.16em;text-transform:uppercase;color:var(--fg-2);margin-bottom:10px;}
+</style></head>
+<body>
+<div class="card">
+  <div class="label">Ink — primary darks</div>
+  <div class="row">
+    <div class="sw"><div class="chip" style="background:#0A0908"></div><div class="name">ink-1000</div><div class="hex">#0A0908</div></div>
+    <div class="sw"><div class="chip" style="background:#14110F"></div><div class="name">ink-900</div><div class="hex">#14110F</div></div>
+    <div class="sw"><div class="chip" style="background:#1F1B17"></div><div class="name">ink-800</div><div class="hex">#1F1B17</div></div>
+    <div class="sw"><div class="chip" style="background:#2A2520"></div><div class="name">ink-700</div><div class="hex">#2A2520</div></div>
+    <div class="sw"><div class="chip" style="background:#6B6259"></div><div class="name">ink-500</div><div class="hex">#6B6259</div></div>
+    <div class="sw"><div class="chip" style="background:#B8AFA3"></div><div class="name">ink-300</div><div class="hex">#B8AFA3</div></div>
+  </div>
+</div>
+</body></html>
