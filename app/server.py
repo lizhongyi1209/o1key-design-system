@@ -366,6 +366,8 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/api/generate":
             self._handle_generate_sync()
+        elif self.path == "/api/generate/gpt-image":
+            self._handle_generate_gpt_image()
         elif self.path == "/api/generate/async":
             self._handle_generate_async()
         elif self.path == "/api/cancel":
@@ -663,6 +665,133 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
         else:
             print(f"[GENERATE-SYNC] 未找到图片数据, content={accumulated_content[:200]}")
             self._json({"error": {"message": "响应中未找到图片数据"}}, 500)
+
+    # ---------- 图片生成 (GPT Image 2 — /v1/images/generations) ----------
+    def _handle_generate_gpt_image(self):
+        """代理 GPT Image 2 文生图请求到 o1key /v1/images/generations"""
+        try:
+            self._handle_generate_gpt_image_inner()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            try:
+                self._json({"error": {"message": f"服务器内部错误: {e}"}}, 500)
+            except Exception:
+                pass
+
+    def _handle_generate_gpt_image_inner(self):
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(content_length))
+        except Exception:
+            self._json({"error": {"message": "请求体解析失败"}}, 400)
+            return
+
+        prompt = body.get("prompt", "")
+        if not prompt:
+            self._json({"error": {"message": "缺少 prompt"}}, 400)
+            return
+
+        model = body.get("model", "gpt-image-2")
+        n = body.get("n", 1)
+        size = body.get("size", "auto")
+        quality = body.get("quality")
+        output_format = body.get("output_format")
+        output_compression = body.get("output_compression")
+        stream = body.get("stream", True)
+        partial_images = body.get("partial_images", 2)
+
+        # 构建 /v1/images/generations 请求体
+        req_body = {
+            "model": model,
+            "prompt": prompt,
+            "n": n,
+            "size": size,
+            "stream": stream,
+            "partial_images": partial_images,
+        }
+
+        if quality:
+            req_body["quality"] = quality
+        if output_format:
+            req_body["output_format"] = output_format
+        if output_compression is not None and output_format in ("jpeg", "webp"):
+            req_body["output_compression"] = output_compression
+
+        gpt_url = f"{O1KEY_BASE}/v1/images/generations"
+
+        print(f"\n[GPT-IMAGE] POST {gpt_url}")
+        print(f"[GPT-IMAGE] req_body: {json.dumps(truncate_base64(req_body), ensure_ascii=False)}")
+
+        hdrs = {
+            "Authorization": f"Bearer {O1KEY_API_KEY}",
+            "Content-Type": "application/json",
+        }
+
+        # 重试循环：流式请求，逐块代理 SSE 到前端
+        resp = None
+        for attempt in range(RETRY_MAX + 1):
+            try:
+                resp = requests.post(gpt_url, headers=hdrs, json=req_body,
+                                    stream=True, timeout=GEN_TIMEOUT)
+            except requests.exceptions.RequestException as e:
+                print(f"[GPT-IMAGE] 请求失败: {e}")
+                self._json({"error": {"message": f"API 请求失败: {e}"}}, 500)
+                return
+
+            if attempt < RETRY_MAX:
+                should_retry = False
+                retry_reason = ""
+                if resp.status_code == 429:
+                    should_retry = True
+                    retry_reason = "429"
+                elif resp.status_code == 400:
+                    try:
+                        err_text = resp.text
+                        if "high load" in err_text.lower():
+                            should_retry = True
+                            retry_reason = "400(high load)"
+                    except Exception:
+                        pass
+
+                if should_retry:
+                    delay = _calc_retry_delay(resp, attempt + 1)
+                    print(f"[GPT-IMAGE] {retry_reason} 重试 {attempt + 1}/{RETRY_MAX}, 等待 {delay:.1f}s")
+                    resp.close()
+                    time.sleep(delay)
+                    continue
+            break
+
+        if resp.status_code != 200:
+            err_text = resp.text[:500] if resp.text else ""
+            print(f"[GPT-IMAGE] 请求失败 [{resp.status_code}]: {err_text}")
+            resp.close()
+            self._json({"error": {"message": f"API 错误 [{resp.status_code}]: {err_text}"}}, resp.status_code)
+            return
+
+        # 开始 SSE 代理：逐行转发 o1key 流到前端
+        print(f"[GPT-IMAGE] 开始 SSE 代理...")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+        try:
+            for line in resp.iter_lines(decode_unicode=True):
+                if line is None:
+                    continue
+                self.wfile.write(f"{line}\n".encode("utf-8"))
+                self.wfile.flush()
+            # 发送结束标记
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            print(f"[GPT-IMAGE] 客户端已断开")
+        finally:
+            resp.close()
+            print(f"[GPT-IMAGE] SSE 代理结束")
 
     # ---------- 图片生成 (o1key 异步 API — 暂不使用，保留备用) ----------
     def _handle_generate_async(self):
@@ -1116,6 +1245,8 @@ if __name__ == "__main__":
         PORT = int(sys.argv[1])
     if len(sys.argv) > 2:
         HISTORY_DIR = sys.argv[2]
+        if not os.path.isabs(HISTORY_DIR):
+            HISTORY_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), HISTORY_DIR)
         THUMBS_DIR = os.path.join(HISTORY_DIR, "thumbs")
     print(f"o1key Image Server: http://localhost:{PORT}/home.html")
     print(f"API Base: {O1KEY_BASE}")

@@ -20,7 +20,7 @@ if %errorlevel% equ 0 (
 )
 
 REM Set port-specific output directory
-set OUTDIR=output\%PORT%
+set OUTDIR=%~dp0output\%PORT%
 
 echo ========================================
 echo o1key ai generator - Port %PORT%

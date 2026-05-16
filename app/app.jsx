@@ -254,6 +254,211 @@ async function callGeminiImageGeneration(prompt, refImages, aspectRatio, modelId
   };
 }
 
+// 调用 GPT Image 2 文生图（通过本地代理 → o1key /v1/images/generations）
+// 后端代理 SSE 流，前端用 ReadableStream 逐块接收，实时回调 onPartialImage
+async function callGptImageGeneration(prompt, modelId, n, size, quality, outputFormat, outputCompression, billingMode, onPartialImage, signal, requestId) {
+  const debug = { request: null, response: null, error: null };
+
+  const apiModel = billingMode === 'per-image' ? 'gpt-image-2-c' : 'gpt-image-2';
+
+  const requestBody = {
+    prompt,
+    model: apiModel,
+    n: n || 1,
+    size: size || 'auto',
+    stream: true,
+    partial_images: 2,
+  };
+
+  if (quality) {
+    requestBody.quality = quality;
+  }
+  if (outputFormat) {
+    requestBody.output_format = outputFormat;
+  }
+  if (outputCompression != null && (outputFormat === 'jpeg' || outputFormat === 'webp')) {
+    requestBody.output_compression = outputCompression;
+  }
+
+  const url = '/api/generate/gpt-image';
+
+  debug.request = {
+    url,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: { ...requestBody },
+  };
+
+  console.group('%c📤 GPT Image 2 API 请求 (SSE 流式)', 'color:#10B981;font-weight:bold');
+  console.log('URL:', url);
+  console.log('Model:', requestBody.model, `(app: ${modelId})`);
+  console.log('Prompt:', prompt);
+  console.log('Size:', size, '· N:', n, '· Quality:', quality, '· Format:', outputFormat);
+  console.log('Request Body:', sanitizeLog(requestBody));
+  console.groupEnd();
+
+  const MAX_RETRIES = 3;
+  const startTime = performance.now();
+  let response;
+  let attempt = 0;
+
+  // 连接重试（仅针对网络错误 / 429 / 5xx / 400 过载）
+  while (attempt <= MAX_RETRIES) {
+    if (attempt > 0) {
+      const waitMs = Math.pow(2, attempt - 1) * 1000;
+      console.log(`%c⏳ 指数退让重试 #${attempt}, 等待 ${waitMs / 1000}s...`, 'color:#F2B33D');
+      await new Promise(r => setTimeout(r, waitMs));
+    }
+    try {
+      response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Request-ID': requestId || '' },
+        body: JSON.stringify(requestBody),
+        signal: signal || null,
+      });
+    } catch (fetchErr) {
+      if (fetchErr.name === 'AbortError') {
+        debug.error = '已取消';
+        console.log('%c⏹️ 请求已取消 (AbortError)', 'color:#F59E0B');
+        throw fetchErr;
+      }
+      if (attempt >= MAX_RETRIES) {
+        debug.error = `网络错误 (已重试${MAX_RETRIES}次): ${fetchErr.message}`;
+        console.error('%c❌ 网络请求最终失败', 'color:#EF4444;font-weight:bold', fetchErr);
+        throw new Error(debug.error);
+      }
+      console.warn(`%c⚠️ 网络错误, 尝试 ${attempt + 1}/${MAX_RETRIES + 1}: ${fetchErr.message}`, 'color:#F2B33D');
+      attempt++;
+      continue;
+    }
+
+    // 非 200 时读取错误体判断是否重试
+    if (!response.ok) {
+      let retryReason = null;
+      if (response.status === 429) {
+        retryReason = '429';
+      } else if (response.status >= 500) {
+        retryReason = `${response.status}`;
+      } else if (response.status === 400) {
+        try {
+          const clone = response.clone();
+          const errData = await clone.json();
+          if (/high load/i.test(errData?.error?.message || '')) {
+            retryReason = '400(high load)';
+          }
+        } catch (e) { /* ignore */ }
+      }
+
+      if (retryReason && attempt < MAX_RETRIES) {
+        const waitMs = Math.pow(2, attempt) * 1000;
+        console.warn(`%c⚠️ ${retryReason} 重试 ${attempt + 1}/${MAX_RETRIES + 1}, 等待 ${waitMs / 1000}s`, 'color:#F2B33D');
+        attempt++;
+        continue;
+      }
+
+      // 不可重试的错误 → 直接报错
+      const errText = await response.text();
+      let errData;
+      try { errData = JSON.parse(errText); } catch (e) { errData = errText; }
+      let rawMsg = errData?.error?.message || `HTTP ${response.status}`;
+      if (/invalid.*token/i.test(rawMsg)) {
+        rawMsg = '令牌不可用，请检查余额或是否正确！';
+      } else if (/high load/i.test(rawMsg)) {
+        rawMsg = '模型过载，请稍后重试';
+      }
+      debug.error = rawMsg;
+      debug.response = { status: response.status, body: errData };
+      console.group('%c❌ GPT Image API 返回错误', 'color:#EF4444;font-weight:bold');
+      console.log('Status:', response.status, '· 共尝试', attempt + 1, '次');
+      console.log('Response:', sanitizeLog(errData));
+      console.groupEnd();
+      throw new Error(debug.error);
+    }
+    break; // 200 → 进入流读取
+  }
+
+  // --- SSE 流读取 ---
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let finalImageUrl = null;
+  let revisedPrompt = '';
+
+  console.log('%c📡 开始接收 SSE 流...', 'color:#10B981');
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop(); // 保留不完整行
+
+      for (const line of lines) {
+        if (!line) continue;
+
+        let dataStr = line;
+        if (line.startsWith('data: ')) dataStr = line.slice(6);
+        else if (line.startsWith('data:')) dataStr = line.slice(5);
+        else continue;
+
+        if (!dataStr || dataStr === '[DONE]') continue;
+
+        try {
+          const chunk = JSON.parse(dataStr);
+
+          // 局部预览图 → 实时回调
+          if (chunk.partial_images && onPartialImage) {
+            const pImgs = Array.isArray(chunk.partial_images) ? chunk.partial_images : [];
+            for (const p of pImgs) {
+              if (p.b64_json) onPartialImage(p.b64_json);
+            }
+          }
+
+          // 最终图片
+          if (chunk.data && Array.isArray(chunk.data) && chunk.data.length > 0) {
+            const img = chunk.data[0];
+            if (img.b64_json) {
+              finalImageUrl = `data:image/${outputFormat || 'png'};base64,${img.b64_json}`;
+            } else if (img.url) {
+              finalImageUrl = img.url;
+            }
+            if (img.revised_prompt) {
+              revisedPrompt = img.revised_prompt;
+            }
+          }
+        } catch (e) {
+          // 跳过无法解析的行
+        }
+      }
+    }
+  } catch (streamErr) {
+    if (streamErr.name === 'AbortError') {
+      debug.error = '已取消';
+      console.log('%c⏹️ SSE 流读取已取消', 'color:#F59E0B');
+      throw streamErr;
+    }
+    throw streamErr;
+  }
+
+  const elapsed = (performance.now() - startTime).toFixed(0);
+  console.log(`%c✅ SSE 流完成: ${elapsed}ms`, 'color:#10B981');
+
+  if (!finalImageUrl) {
+    debug.error = '响应中未找到图片数据';
+    console.warn('⚠️ SSE 流中未提取到图片');
+    throw new Error('响应中未找到图片数据');
+  }
+
+  return {
+    url: finalImageUrl,
+    tokens: 0,
+    responseContent: null,
+    debug,
+  };
+}
+
 function sanitizeLog(obj) {
   if (typeof obj === 'string') {
     if (obj.startsWith('data:') && obj.includes(';base64,')) {
@@ -368,6 +573,23 @@ function clampGptSize(w, h) {
   w = Math.max(16, Math.min(3840, Math.round(w / 16) * 16 || 16));
   h = Math.max(16, Math.min(3840, Math.round(h / 16) * 16 || 16));
   return { w, h };
+}
+
+// GPT Image 2 尺寸 → { w, h }，auto 返回 null
+function getGptSizeDims(gptSize, customW, customH) {
+  const MAP = {
+    '1024x1024':  { w: 1024, h: 1024 },
+    '1536x1024':  { w: 1536, h: 1024 },
+    '1024x1536':  { w: 1024, h: 1536 },
+    '2048x2048':  { w: 2048, h: 2048 },
+    '2048x1152':  { w: 2048, h: 1152 },
+    '2048x1536':  { w: 2048, h: 1536 },
+    '3840x2160':  { w: 3840, h: 2160 },
+    '2160x3840':  { w: 2160, h: 3840 },
+  };
+  if (gptSize === 'auto') return null;
+  if (gptSize === 'custom') return { w: customW || 1024, h: customH || 1024 };
+  return MAP[gptSize] || null;
 }
 
 // ---------- 批量模式 ----------
@@ -782,7 +1004,7 @@ function App() {
   const [count, setCount] = useState(1);
   const [model, setModel] = useState('pro');
   const [resolution, setResolution] = useState('1K');
-  const [billingMode, setBillingMode] = useState('per-use'); // 'per-use' | 'per-image'
+  const [billingMode, setBillingMode] = useState('per-image'); // 'per-image' | 'per-use'
   const [gptSize, setGptSize] = useState('auto');
   const [gptQuality, setGptQuality] = useState('auto');
   const [gptFormat, setGptFormat] = useState('png');
@@ -799,7 +1021,6 @@ function App() {
     if (!aspectOk) setAspect('1:1');
     const resOk = (RESOLUTIONS[model] || []).some(r => r.id === resolution);
     if (!resOk) setResolution('1K');
-    if (model === 'nano') setBillingMode('per-image');
   }, [model]); // eslint-disable-line react-hooks/exhaustive-deps
   const [generations, setGenerations] = useState([]); // newest first
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -1140,16 +1361,26 @@ function App() {
     const pairInfo = overrides.pairInfo || null;
 
     const genId = Math.random().toString(36).slice(2);
-    const aspectPreset = ASPECT_PRESETS.find(p => p.id === a);
     const modelObj = MODELS.find(mo => mo.id === m);
-    const outDims = getOutputDims(a, r);
+    const isGpt = m === 'gpt2';
+
+    // GPT 从 gptSize 算尺寸 / 比例；Gemini 从 aspect + resolution 算
+    const gptDims = isGpt ? getGptSizeDims(gptSize, gptCustomW, gptCustomH) : null;
+    const aspectPreset = isGpt ? null : ASPECT_PRESETS.find(p => p.id === a);
+    const outDims = isGpt ? gptDims : getOutputDims(a, r);
+    const displayAspect = isGpt
+      ? (gptDims ? `${gptDims.w}:${gptDims.h}` : 'auto')
+      : a;
+    const aspectStyle = isGpt
+      ? (gptDims ? { aspectRatio: `${gptDims.w} / ${gptDims.h}` } : {})
+      : (aspectPreset ? { aspectRatio: `${aspectPreset.w} / ${aspectPreset.h}` } : {});
 
     const gen = {
       id: genId,
       prompt: singlePrompt,
-      aspect: a,
-      aspectStyle: { aspectRatio: `${aspectPreset.w} / ${aspectPreset.h}` },
-      resolution: r,
+      aspect: displayAspect,
+      aspectStyle,
+      resolution: isGpt ? (gptDims ? `${gptDims.w}×${gptDims.h}` : 'auto') : r,
       outDims,
       count: c,
       model: modelObj.name,
@@ -1192,10 +1423,24 @@ function App() {
       (async () => {
         const ctrl = controllers.find(ct => ct.tileId === tile.id);
         try {
-          const result = await callGeminiImageGeneration(
-            singlePrompt, gen.refs, gen.aspect, gen.modelId, gen.resolution, null,
-            ctrl?.abortController?.signal, ctrl?.requestId, gen.googleSearch, gen.thinkingLevel, gen.billingMode
-          );
+          const isGpt = gen.modelId === 'gpt2';
+          const result = isGpt
+            ? await callGptImageGeneration(
+                singlePrompt, gen.modelId, gen.count || 1, gen.gptSize, gen.gptQuality,
+                gen.gptFormat, gen.gptCompression, gen.billingMode,
+                (partialB64) => {
+                  const partialUrl = `data:image/${gen.gptFormat || 'png'};base64,${partialB64}`;
+                  setGenerations(prev => prev.map(g => {
+                    if (g.id !== genId) return g;
+                    return { ...g, tiles: g.tiles.map(t => t.id === tile.id ? { ...t, partialUrl } : t) };
+                  }));
+                },
+                ctrl?.abortController?.signal, ctrl?.requestId
+              )
+            : await callGeminiImageGeneration(
+                singlePrompt, gen.refs, gen.aspect, gen.modelId, gen.resolution, null,
+                ctrl?.abortController?.signal, ctrl?.requestId, gen.googleSearch, gen.thinkingLevel, gen.billingMode
+              );
           setGenerations(prev => prev.map(g => {
             if (g.id !== genId) return g;
             return {
@@ -2059,12 +2304,17 @@ function App() {
               {tile.status === 'loading' && (() => {
                 const elapsed = gen.time ? Math.floor((Date.now() - new Date(gen.time).getTime()) / 1000) : 0;
                 return (
-                  <div className="skeleton-inner" style={{flexDirection:'column',gap:8}}>
-                    <div className="skeleton-spinner" />
-                    <span style={{fontSize:11,color:'var(--fg-3)',fontFamily:'var(--font-mono)'}}>
-                      {elapsed}s
-                    </span>
-                  </div>
+                  <React.Fragment>
+                    {tile.partialUrl && (
+                      <img className="gen-tile-img" src={tile.partialUrl} alt="" style={{position:'absolute',inset:0,opacity:.7}} />
+                    )}
+                    <div className="skeleton-inner" style={{flexDirection:'column',gap:8,zIndex:1}}>
+                      <div className="skeleton-spinner" />
+                      <span style={{fontSize:11,color:'var(--fg-3)',fontFamily:'var(--font-mono)'}}>
+                        {elapsed}s
+                      </span>
+                    </div>
+                  </React.Fragment>
                 );
               })()}
               {tile.status === 'cancelled' && (
@@ -2098,6 +2348,7 @@ function App() {
                         url: tile.url,
                         prompt: gen.prompt,
                         model: gen.model,
+                        modelId: gen.modelId,
                         resolution: gen.resolution,
                         aspect: gen.aspect,
                         outDims: gen.outDims,
@@ -2108,6 +2359,9 @@ function App() {
                         isEdit: gen.isEdit,
                         originalPrompt: gen.originalPrompt,
                         cancelled: gen.cancelled,
+                        gptQuality: gen.gptQuality,
+                        gptFormat: gen.gptFormat,
+                        gptCompression: gen.gptCompression,
                       });
                     }} />
                   <div className="gen-tile-overlay">
@@ -2347,8 +2601,18 @@ function App() {
             <div className="lightbox-info">
               <div className="lightbox-meta">
                 <span className="lightbox-meta-item"><span className="lightbox-meta-label">模型</span>{lightbox.model}</span>
-                <span className="lightbox-meta-item"><span className="lightbox-meta-label">尺寸</span>{lightbox.resolution}{lightbox.outDims ? ` · ${lightbox.outDims.w}×${lightbox.outDims.h}` : ''}</span>
-                <span className="lightbox-meta-item"><span className="lightbox-meta-label">比例</span>{lightbox.aspect}</span>
+                <span className="lightbox-meta-item"><span className="lightbox-meta-label">尺寸</span>{lightbox.outDims ? `${lightbox.outDims.w}×${lightbox.outDims.h}` : (lightbox.resolution || '—')}</span>
+                {lightbox.modelId === 'gpt2' ? (
+                  <React.Fragment>
+                    <span className="lightbox-meta-item"><span className="lightbox-meta-label">质量</span>{lightbox.gptQuality || 'auto'}</span>
+                    <span className="lightbox-meta-item"><span className="lightbox-meta-label">格式</span>{lightbox.gptFormat || 'png'}{lightbox.gptCompression != null && (lightbox.gptFormat === 'jpeg' || lightbox.gptFormat === 'webp') ? ` · ${lightbox.gptCompression}%` : ''}</span>
+                  </React.Fragment>
+                ) : (
+                  <React.Fragment>
+                    <span className="lightbox-meta-item"><span className="lightbox-meta-label">分辨率</span>{lightbox.resolution}</span>
+                    <span className="lightbox-meta-item"><span className="lightbox-meta-label">比例</span>{lightbox.aspect}</span>
+                  </React.Fragment>
+                )}
                 {lightbox.totalTokens > 0 && (
                   <span className="lightbox-meta-item"><span className="lightbox-meta-label">Tokens</span>{formatTokens(lightbox.totalTokens)}</span>
                 )}
