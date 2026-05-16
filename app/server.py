@@ -40,21 +40,23 @@ ROUTE_DOMAINS = {
 
 # ---------- o1key API 配置 ----------
 O1KEY_BASE = "https://api.o1key.cn"
-O1KEY_API_KEY = os.environ.get("O1KEY_API_KEY", "sk-GknXryJw9kQbiufQAJ4tNiqEWt3iEPUG2yjBjDN8FVzKYLxQ")
+O1KEY_API_KEY = os.environ.get("O1KEY_API_KEY", "")
+_CONFIGURED = False  # 用户是否已通过 API 设置面板保存过 Key
 
 
 def load_config():
     """从 config.json 加载配置，不存在则返回默认值"""
-    global O1KEY_BASE, O1KEY_API_KEY
+    global O1KEY_BASE, O1KEY_API_KEY, _CONFIGURED
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
             route = cfg.get("route", "global")
             O1KEY_BASE = ROUTE_DOMAINS.get(route, ROUTE_DOMAINS["global"])
-            if "api_key" in cfg:
+            if cfg.get("api_key"):
                 O1KEY_API_KEY = cfg["api_key"]
-            print(f"[CONFIG] 已加载: route={route}, base={O1KEY_BASE}, key={'***' + O1KEY_API_KEY[-8:] if O1KEY_API_KEY else 'EMPTY'}")
+                _CONFIGURED = True
+            print(f"[CONFIG] 已加载: route={route}, base={O1KEY_BASE}, configured={_CONFIGURED}, key={'***' + O1KEY_API_KEY[-8:] if O1KEY_API_KEY else 'EMPTY'}")
         except Exception as e:
             print(f"[CONFIG] 加载失败: {e}，使用默认配置")
     else:
@@ -63,12 +65,13 @@ def load_config():
 
 def save_config(route, api_key):
     """保存配置到 config.json"""
-    global O1KEY_BASE, O1KEY_API_KEY
+    global O1KEY_BASE, O1KEY_API_KEY, _CONFIGURED
     cfg = {"route": route, "api_key": api_key}
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
     O1KEY_BASE = ROUTE_DOMAINS.get(route, ROUTE_DOMAINS["global"])
     O1KEY_API_KEY = api_key
+    _CONFIGURED = True
     print(f"[CONFIG] 已保存并应用: route={route}, base={O1KEY_BASE}")
 
 
@@ -102,6 +105,7 @@ ACTIVE_TASKS_LOCK = threading.Lock()
 PER_USE_MODELS = {
     "nano-banana-pro": "gemini-3-pro-image-preview",
     "nano-banana-2": "gemini-3.1-flash-image-preview",
+    "nano-banana": "nano-banana",
     "gemini-3-pro-image-preview": "gemini-3-pro-image-preview",
     "gemini-3.1-flash-image-preview": "gemini-3.1-flash-image-preview",
 }
@@ -126,6 +130,10 @@ def get_o1key_model(gemini_model, image_size):
          2K      → nano-banana-2-2k
          4K      → nano-banana-2-4k
     """
+    # nano-banana (无后缀): 直接返回，不拼分辨率
+    if gemini_model == 'nano-banana':
+        return 'nano-banana'
+
     if image_size == '512':
         size_suffix = '0.5k'
     else:
@@ -373,9 +381,9 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
         else:
             self._json({"error": "not found"}, 404)
 
-    # ---------- 图片生成 (Gemini 原生同步 API) ----------
+    # ---------- 图片生成 (OpenAI Chat Completions API) ----------
     def _handle_generate_sync(self):
-        """代理图片生成请求到 o1key Gemini 原生同步 API"""
+        """代理图片生成请求到 o1key /v1/chat/completions（OpenAI 兼容格式）"""
         try:
             self._handle_generate_sync_inner()
         except Exception as e:
@@ -476,7 +484,7 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
 
             print(f"\n[GENERATE-SYNC] (旧格式兼容) prompt={prompt[:80]!r} model={gemini_model} aspect={aspect_ratio} size={image_size}")
         else:
-            # 新格式：前端直接发 Gemini 原生格式
+            # 新格式：前端发 Gemini 原生格式，后端转换为 OpenAI Chat Completions 格式
             if not contents:
                 self._json({"error": {"message": "缺少 prompt 或 contents"}}, 400)
                 return
@@ -495,22 +503,64 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
 
             print(f"\n[GENERATE-SYNC] prompt={prompt_preview!r} model={gemini_model} aspect={aspect_ratio} size={image_size}")
 
-            # 图片部件透传（R2 上传已停用）
-            self._process_contents_images(contents)
+        # 构建 OpenAI Chat Completions 格式请求体
+        # 将 Gemini 原生 contents 转为 messages
+        messages = []
+        for c in contents:
+            role = c.get("role", "user")
+            parts = c.get("parts", [])
+            has_images = any("inlineData" in p or "fileData" in p for p in parts)
+            if has_images:
+                content = []
+                for p in parts:
+                    if "text" in p:
+                        content.append({"type": "text", "text": p["text"]})
+                    elif "inlineData" in p:
+                        mime = p["inlineData"].get("mimeType", "image/png")
+                        data = p["inlineData"].get("data", "")
+                        content.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}})
+                    elif "fileData" in p:
+                        uri = p["fileData"].get("fileUri", "")
+                        content.append({"type": "image_url", "image_url": {"url": uri}})
+            else:
+                content = " ".join(p.get("text", "") for p in parts)
+            messages.append({"role": role, "content": content})
 
-        req_body = {
-            "contents": contents,
-            "generationConfig": generation_config,
-        }
+        # 构建 extra_body.google
+        google_extra = {}
+        image_config = (generation_config or {}).get("imageConfig", {})
+        if image_config:
+            google_extra["image_config"] = {
+                "aspect_ratio": image_config.get("aspectRatio", "1:1"),
+                "image_size": image_config.get("imageSize", "1K"),
+            }
+        thinking_config = (generation_config or {}).get("thinkingConfig")
+        if thinking_config:
+            google_extra["thinking_config"] = {
+                "thinking_level": thinking_config.get("thinkingLevel", "low"),
+                "include_thoughts": thinking_config.get("includeThoughts", True),
+            }
+        tools = body.get("tools")
+        if tools:
+            google_extra["tools"] = tools
 
         billing = body.get("billing", "per-image")
         if billing == "per-use":
-            sync_model = get_per_use_model(gemini_model)
+            chat_model = get_per_use_model(gemini_model)
         else:
-            sync_model = get_o1key_model(gemini_model, image_size)
-        sync_url = f"{O1KEY_BASE}/v1beta/models/{sync_model}:streamGenerateContent/?alt=sse"
+            chat_model = get_o1key_model(gemini_model, image_size)
 
-        print(f"[GENERATE-SYNC] POST (stream) billing={billing} {sync_url}")
+        req_body = {
+            "model": chat_model,
+            "stream": True,
+            "messages": messages,
+        }
+        if google_extra:
+            req_body["extra_body"] = {"google": google_extra}
+
+        sync_url = f"{O1KEY_BASE}/v1/chat/completions"
+
+        print(f"[GENERATE-SYNC] POST (OpenAI chat) billing={billing} {sync_url}")
         print(f"[GENERATE-SYNC] req_body: {json.dumps(truncate_base64(req_body), ensure_ascii=False)}")
         tc = (generation_config or {}).get("thinkingConfig")
         if tc:
@@ -543,23 +593,23 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
         if resp.status_code != 200:
             err_text = resp.text[:500]
             print(f"[ERROR] 请求失败 [{resp.status_code}]: {err_text}")
-            self._json({"error": {"message": f"API 错误 [{resp.status_code}]: {err_text}"}}, resp.status_code)
+            if resp.status_code == 503:
+                self._json({"error": {"message": "模型暂不可用，请稍后重试或检查分组"}}, resp.status_code)
+            else:
+                self._json({"error": {"message": f"API 错误 [{resp.status_code}]: {err_text}"}}, resp.status_code)
             return
 
-        # 解析 SSE 文本 (一次性读取完整响应，然后逐行解析)
-        accumulated_data = ""
-        accumulated_mime = "image/png"
-        accumulated_text = ""
+        # 解析 OpenAI 流式 SSE 响应
+        # 格式: choices[].delta.content 拼接得到 "![image](data:image/...;base64,...)"
+        accumulated_content = ""
         line_count = 0
         for line in resp.text.splitlines():
             if not line:
                 continue
 
-            # 剥离 SSE "data:" 前缀（兼容 "data:" / "data: " / "data:  " 等变体）
             if line.startswith("data:"):
                 line = line[5:].lstrip()
 
-            # 跳过空数据行和 SSE 结束标记
             if not line or line == "[DONE]":
                 continue
 
@@ -570,33 +620,36 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
 
             line_count += 1
 
-            # 格式兼容:
-            #   1. 标准 Gemini:  {"candidates": [{"content": {"parts": [{"text": "..."}]}}], ...}
-            #   2. 裸数组:        [{"content": {"parts": [...]}}]
-            #   3. 纯元数据包:    {"usageMetadata": {...}}  (无 candidates)
-            candidates = chunk if isinstance(chunk, list) else chunk.get("candidates", [])
+            choices = chunk.get("choices", [])
+            for choice in choices:
+                delta = choice.get("delta", {})
+                content = delta.get("content", "")
+                if content:
+                    accumulated_content += content
 
-            for candidate in candidates:
-                content = (candidate.get("content") or {}) if isinstance(candidate, dict) else {}
-                for part in (content.get("parts") or []):
-                    # 文本片段 (连续的思考 / 描述)
-                    if "text" in part:
-                        accumulated_text += part["text"]
-                    # 图片 data 片段 (base64 分片拼接)
-                    inline = part.get("inlineData") or {}
-                    chunk_data = inline.get("data", "").strip()
-                    if chunk_data:
-                        accumulated_data += chunk_data
-                        accumulated_mime = inline.get("mimeType", accumulated_mime)
+        print(f"[GENERATE-SYNC] 流完成: {line_count} 行, content={len(accumulated_content)} chars")
 
-        print(f"[GENERATE-SYNC] 流完成: {line_count} 行, text={len(accumulated_text)} chars, image_data={len(accumulated_data)} chars")
+        # 从 Markdown 图片语法中提取 data URL: ![image](data:image/jpeg;base64,...)
+        idx = accumulated_content.find("data:image/")
+        if idx >= 0:
+            end_idx = accumulated_content.find(")", idx)
+            if end_idx >= 0:
+                raw = accumulated_content[idx:end_idx]
+            else:
+                raw = accumulated_content[idx:]
+            # 移除 base64 中可能的空白字符
+            image_url = re.sub(r'\s+', '', raw)
+            mime_match = re.match(r'data:(image/\w+);base64,', image_url)
+            accumulated_mime = mime_match.group(1) if mime_match else "image/png"
+            b64_data = image_url.split(",", 1)[-1] if "," in image_url else ""
+            try:
+                img_bytes = base64.b64decode(b64_data)
+                print(f"[GENERATE-SYNC] 完成: {len(img_bytes)} bytes, {accumulated_mime}")
+            except Exception as e:
+                print(f"[GENERATE-SYNC] base64 解码失败: {e}")
 
-        if accumulated_data:
-            # 移除所有空白字符，防止 data URL 中出现换行/空格导致浏览器 ERR_INVALID_URL
-            accumulated_data = re.sub(r'\s+', '', accumulated_data)
-            img_bytes = base64.b64decode(accumulated_data)
             response = {
-                "image_url": f"data:{accumulated_mime};base64,{accumulated_data}",
+                "image_url": image_url,
                 "debug": {
                     "upstream_url": sync_url,
                     "upstream_body": req_body,
@@ -608,7 +661,7 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 print(f"[GENERATE-SYNC] 客户端已断开, 响应未发送")
         else:
-            print(f"[GENERATE-SYNC] 未找到图片数据, text={accumulated_text[:200]}")
+            print(f"[GENERATE-SYNC] 未找到图片数据, content={accumulated_content[:200]}")
             self._json({"error": {"message": "响应中未找到图片数据"}}, 500)
 
     # ---------- 图片生成 (o1key 异步 API — 暂不使用，保留备用) ----------
@@ -793,6 +846,7 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
             "route": route,
             "base_url": O1KEY_BASE,
             "hasKey": bool(O1KEY_API_KEY),
+            "configured": _CONFIGURED,
             "apiKey": O1KEY_API_KEY or "",
             "keyPreview": ("***" + O1KEY_API_KEY[-8:]) if O1KEY_API_KEY else "",
         })
@@ -852,8 +906,10 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
 
     def _handle_config_clear(self):
         """清除已保存的 API Key，保留线路配置"""
+        global _CONFIGURED
         try:
             save_config(current_route(), "")
+            _CONFIGURED = False
             self._json({"ok": True})
         except Exception as e:
             self._json({"ok": False, "error": f"清除失败: {e}"}, 500)

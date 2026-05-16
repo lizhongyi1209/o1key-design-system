@@ -6,14 +6,16 @@
 // ---------- 模型映射 ----------
 // 应用模型 ID → o1key 模型名（server.py 结合 imageSize 拼分辨率后缀）
 const APP_MODEL_MAP = {
-  pro: 'nano-banana-pro',
-  v2:  'nano-banana-2',
+  pro:  'nano-banana-pro',
+  v2:   'nano-banana-2',
+  nano: 'nano-banana',
 };
 
 // 按量计费：应用模型 ID → Gemini 原始模型名（不拼分辨率）
 const APP_MODEL_MAP_PER_USE = {
-  pro: 'gemini-3-pro-image-preview',
-  v2:  'gemini-3.1-flash-image-preview',
+  pro:  'gemini-3-pro-image-preview',
+  v2:   'gemini-3.1-flash-image-preview',
+  nano: 'nano-banana',
 };
 
 // 分辨率 ID → API imageSize 值 (0.5K 映射为 "512")
@@ -285,16 +287,16 @@ const { useState, useRef, useEffect, useCallback } = React;
 // ---------- 数据 ----------
 // 所有支持的宽高比（按模型过滤）。w/h 是真实比值，仅用于形状预览。
 const ASPECT_PRESETS = [
-  { id: '1:1',  w: 1,  h: 1,  models: ['pro', 'v2'] },
-  { id: '2:3',  w: 2,  h: 3,  models: ['pro', 'v2'] },
-  { id: '3:2',  w: 3,  h: 2,  models: ['pro', 'v2'] },
-  { id: '3:4',  w: 3,  h: 4,  models: ['pro', 'v2'] },
-  { id: '4:3',  w: 4,  h: 3,  models: ['pro', 'v2'] },
-  { id: '4:5',  w: 4,  h: 5,  models: ['pro', 'v2'] },
-  { id: '5:4',  w: 5,  h: 4,  models: ['pro', 'v2'] },
-  { id: '9:16', w: 9,  h: 16, models: ['pro', 'v2'] },
-  { id: '16:9', w: 16, h: 9,  models: ['pro', 'v2'] },
-  { id: '21:9', w: 21, h: 9,  models: ['pro', 'v2'] },
+  { id: '1:1',  w: 1,  h: 1,  models: ['pro', 'v2', 'nano'] },
+  { id: '2:3',  w: 2,  h: 3,  models: ['pro', 'v2', 'nano'] },
+  { id: '3:2',  w: 3,  h: 2,  models: ['pro', 'v2', 'nano'] },
+  { id: '3:4',  w: 3,  h: 4,  models: ['pro', 'v2', 'nano'] },
+  { id: '4:3',  w: 4,  h: 3,  models: ['pro', 'v2', 'nano'] },
+  { id: '4:5',  w: 4,  h: 5,  models: ['pro', 'v2', 'nano'] },
+  { id: '5:4',  w: 5,  h: 4,  models: ['pro', 'v2', 'nano'] },
+  { id: '9:16', w: 9,  h: 16, models: ['pro', 'v2', 'nano'] },
+  { id: '16:9', w: 16, h: 9,  models: ['pro', 'v2', 'nano'] },
+  { id: '21:9', w: 21, h: 9,  models: ['pro', 'v2', 'nano'] },
   // v2 (Flash) 独有的极致比例
   { id: '1:4',  w: 1,  h: 4,  models: ['v2'] },
   { id: '1:8',  w: 1,  h: 8,  models: ['v2'] },
@@ -305,6 +307,7 @@ const ASPECT_PRESETS = [
 const MODELS = [
   { id: 'pro', name: 'Nano Banana Pro', short: 'Pro',  desc: '高质量 · 复杂推理' },
   { id: 'v2',  name: 'Nano Banana 2',   short: 'v2',   desc: '快速 · 高用量' },
+  { id: 'nano', name: 'Nano Banana',     short: 'Nano', desc: '均衡 · 通用生成' },
   { id: 'gpt2', name: 'GPT Image 2', short: 'GPT2', desc: 'OpenAI · 高质量图像生成' },
 ];
 
@@ -486,6 +489,9 @@ const RESOLUTIONS = {
     { id: '2K', label: '2K', desc: '高清' },
     { id: '4K', label: '4K', desc: '超清' },
   ],
+  nano: [
+    { id: '1K', label: '1K', desc: '标清' },
+  ],
   v2: [
     { id: '0.5K', label: '0.5K', desc: '草稿' },
     { id: '1K',   label: '1K',   desc: '标清' },
@@ -584,12 +590,14 @@ function ResolutionSegment({ resolution, setResolution, model }) {
   );
 }
 
-function BillingSegment({ billingMode, setBillingMode }) {
+function BillingSegment({ billingMode, setBillingMode, hidePerUse }) {
   return (
     <div className="seg">
+      {!hidePerUse && (
       <button className={`seg-item ${billingMode === 'per-use' ? 'active' : ''}`} onClick={() => setBillingMode('per-use')}>
         按量计费
       </button>
+      )}
       <button className={`seg-item ${billingMode === 'per-image' ? 'active' : ''}`} onClick={() => setBillingMode('per-image')}>
         按张计费
       </button>
@@ -785,11 +793,13 @@ function App() {
   const [gptCustomHStr, setGptCustomHStr] = useState('1024');
 
   // 切换模型时：若当前 aspect / resolution 在新模型下不可用，clamp 到合法值
+  // Nano Banana 固定为按张计费
   useEffect(() => {
     const aspectOk = ASPECT_PRESETS.some(p => p.id === aspect && p.models.includes(model));
     if (!aspectOk) setAspect('1:1');
     const resOk = (RESOLUTIONS[model] || []).some(r => r.id === resolution);
     if (!resOk) setResolution('1K');
+    if (model === 'nano') setBillingMode('per-image');
   }, [model]); // eslint-disable-line react-hooks/exhaustive-deps
   const [generations, setGenerations] = useState([]); // newest first
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -873,8 +883,9 @@ function App() {
       .then(cfg => {
         setCurrentRoute(cfg.route || 'global');
         setSelectedRoute(cfg.route || 'global');
-        setHasSavedKey(cfg.hasKey || false);
-        setSavedApiKey(cfg.apiKey || '');
+        const configured = cfg.configured || false;
+        setHasSavedKey(configured);
+        setSavedApiKey(configured ? (cfg.apiKey || '') : '');
       })
       .catch(() => {});
   }, []);
@@ -896,8 +907,9 @@ function App() {
       .then(cfg => {
         setCurrentRoute(cfg.route || 'global');
         setSelectedRoute(cfg.route || 'global');
-        setHasSavedKey(cfg.hasKey || false);
-        const key = cfg.apiKey || savedApiKey;
+        const configured = cfg.configured || false;
+        setHasSavedKey(configured);
+        const key = configured ? (cfg.apiKey || '') : '';
         setSavedApiKey(key);
         setInputApiKey(key);
       })
@@ -1230,6 +1242,10 @@ function App() {
   const doGenerate = (params) => {
     const input = (params ? params.prompt : prompt).trim();
     if (!input) return;
+    if (!hasSavedKey) {
+      openApiSettings();
+      return;
+    }
     const a = params ? params.aspect : aspect;
     const r = params ? params.resolution : resolution;
     const m = params ? params.modelId : model;
@@ -1594,7 +1610,6 @@ function App() {
             <img src="logo.png" alt="o1key" style={{width:32,height:32,borderRadius:9,display:'block'}} />
           </div>
           <span className="brand-name">o1key</span>
-          <span className="brand-tag">高效创作</span>
         </div>
         <div className="header-actions">
           <button className="icon-btn" onClick={openApiSettings} title="API 设置">
@@ -1871,7 +1886,7 @@ function App() {
                         ))}
                       </div>
                     </div>
-                    {model !== 'gpt2' && (
+                    {model !== 'gpt2' && model !== 'nano' && (
                       <React.Fragment>
                         <div className="params-section">
                           <div className="params-label">谷歌搜索</div>
@@ -1893,7 +1908,7 @@ function App() {
                     )}
                     <div className="params-section">
                       <div className="params-label">计费方式 <span className="params-val">{billingMode === 'per-use' ? '按量' : '按张'}</span></div>
-                      <BillingSegment billingMode={billingMode} setBillingMode={setBillingMode} />
+                      <BillingSegment billingMode={billingMode} setBillingMode={setBillingMode} hidePerUse={model === 'nano'} />
                     </div>
                   </div>
                 )}
@@ -2000,7 +2015,7 @@ function App() {
               <span className="composer-bar-divider" />
               <button className="tool-btn mobile-drawer-toggle" onClick={() => setDrawerOpen(true)}>
                 <Icon name="sliders" size={16} />
-                <span>{model === 'pro' ? 'Pro' : 'v2'} · {resolution} · {aspect} · {count} 张</span>
+                <span>{(MODELS.find(m => m.id === model) || MODELS[0]).short} · {resolution} · {aspect} · {count} 张</span>
               </button>
             </div>
             <div className="composer-bar-right">
@@ -2259,7 +2274,7 @@ function App() {
         </div>
         <div className="drawer-section">
           <div className="setting-label" style={{ marginBottom: 10 }}><span>计费方式</span><span className="val">{billingMode === 'per-use' ? '按量' : '按张'}</span></div>
-          <BillingSegment billingMode={billingMode} setBillingMode={setBillingMode} />
+          <BillingSegment billingMode={billingMode} setBillingMode={setBillingMode} hidePerUse={model === 'nano'} />
         </div>
       </Drawer>
 
