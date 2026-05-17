@@ -31,7 +31,7 @@ echo History dir: %OUTDIR%
 echo.
 
 REM Start server in background with port-specific output dir
-start /B "" app\python\python.exe app\server.py %PORT% %OUTDIR%
+start /B "" app\python\python.exe server.py %PORT% %OUTDIR%
 
 REM Poll until server is ready, then open browser immediately
 echo Waiting for server...

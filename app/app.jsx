@@ -255,7 +255,6 @@ async function callGeminiImageGeneration(prompt, refImages, aspectRatio, modelId
 }
 
 // 调用 GPT Image 2 文生图（通过本地代理 → o1key /v1/images/generations）
-// 后端代理 SSE 流，前端用 ReadableStream 逐块接收，实时回调 onPartialImage
 async function callGptImageGeneration(prompt, modelId, n, size, quality, outputFormat, outputCompression, billingMode, onPartialImage, signal, requestId) {
   const debug = { request: null, response: null, error: null };
 
@@ -289,7 +288,7 @@ async function callGptImageGeneration(prompt, modelId, n, size, quality, outputF
     body: { ...requestBody },
   };
 
-  console.group('%c📤 GPT Image 2 API 请求 (SSE 流式)', 'color:#10B981;font-weight:bold');
+  console.group('%c📤 GPT Image 2 API 请求', 'color:#10B981;font-weight:bold');
   console.log('URL:', url);
   console.log('Model:', requestBody.model, `(app: ${modelId})`);
   console.log('Prompt:', prompt);
@@ -302,7 +301,6 @@ async function callGptImageGeneration(prompt, modelId, n, size, quality, outputF
   let response;
   let attempt = 0;
 
-  // 连接重试（仅针对网络错误 / 429 / 5xx / 400 过载）
   while (attempt <= MAX_RETRIES) {
     if (attempt > 0) {
       const waitMs = Math.pow(2, attempt - 1) * 1000;
@@ -332,7 +330,6 @@ async function callGptImageGeneration(prompt, modelId, n, size, quality, outputF
       continue;
     }
 
-    // 非 200 时读取错误体判断是否重试
     if (!response.ok) {
       let retryReason = null;
       if (response.status === 429) {
@@ -356,7 +353,6 @@ async function callGptImageGeneration(prompt, modelId, n, size, quality, outputF
         continue;
       }
 
-      // 不可重试的错误 → 直接报错
       const errText = await response.text();
       let errData;
       try { errData = JSON.parse(errText); } catch (e) { errData = errText; }
@@ -374,85 +370,195 @@ async function callGptImageGeneration(prompt, modelId, n, size, quality, outputF
       console.groupEnd();
       throw new Error(debug.error);
     }
-    break; // 200 → 进入流读取
+    break;
   }
 
-  // --- SSE 流读取 ---
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  let finalImageUrl = null;
-  let revisedPrompt = '';
+  // 解析 JSON 响应
+  const data = await response.json();
+  debug.response = data;
 
-  console.log('%c📡 开始接收 SSE 流...', 'color:#10B981');
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop(); // 保留不完整行
-
-      for (const line of lines) {
-        if (!line) continue;
-
-        let dataStr = line;
-        if (line.startsWith('data: ')) dataStr = line.slice(6);
-        else if (line.startsWith('data:')) dataStr = line.slice(5);
-        else continue;
-
-        if (!dataStr || dataStr === '[DONE]') continue;
-
-        try {
-          const chunk = JSON.parse(dataStr);
-
-          // 局部预览图 → 实时回调
-          if (chunk.partial_images && onPartialImage) {
-            const pImgs = Array.isArray(chunk.partial_images) ? chunk.partial_images : [];
-            for (const p of pImgs) {
-              if (p.b64_json) onPartialImage(p.b64_json);
-            }
-          }
-
-          // 最终图片
-          if (chunk.data && Array.isArray(chunk.data) && chunk.data.length > 0) {
-            const img = chunk.data[0];
-            if (img.b64_json) {
-              finalImageUrl = `data:image/${outputFormat || 'png'};base64,${img.b64_json}`;
-            } else if (img.url) {
-              finalImageUrl = img.url;
-            }
-            if (img.revised_prompt) {
-              revisedPrompt = img.revised_prompt;
-            }
-          }
-        } catch (e) {
-          // 跳过无法解析的行
-        }
-      }
-    }
-  } catch (streamErr) {
-    if (streamErr.name === 'AbortError') {
-      debug.error = '已取消';
-      console.log('%c⏹️ SSE 流读取已取消', 'color:#F59E0B');
-      throw streamErr;
-    }
-    throw streamErr;
+  if (data.error) {
+    debug.error = data.error.message || String(data.error);
+    throw new Error(debug.error);
   }
 
   const elapsed = (performance.now() - startTime).toFixed(0);
-  console.log(`%c✅ SSE 流完成: ${elapsed}ms`, 'color:#10B981');
-
-  if (!finalImageUrl) {
-    debug.error = '响应中未找到图片数据';
-    console.warn('⚠️ SSE 流中未提取到图片');
-    throw new Error('响应中未找到图片数据');
-  }
+  console.log(`%c✅ GPT Image 完成: ${elapsed}ms`, 'color:#10B981');
+  console.log('Image URL:', data.image_url);
 
   return {
-    url: finalImageUrl,
+    url: data.image_url,
+    tokens: 0,
+    responseContent: null,
+    debug,
+  };
+}
+
+// 调用 GPT Image 2 图片编辑（通过本地代理 → o1key /v1/images/edits，multipart/form-data）
+// ⚠️ 【教训 2026-05-17】return 之前的任何代码抛出异常都会导致 tile 静默空白。
+// console.log 中调用了未定义的 truncateBase64 → ReferenceError → 函数抛异常
+// → return 永远不执行 → 调用方 catch 到 error → tile.status='error'
+// → 但 error 状态没有 UI 渲染 → 用户只看到空白占格。
+// 规则：return 前的代码必须零异常；新增辅助函数必须确保定义；所有 tile 状态必须有 UI。
+async function callGptImageEdit(prompt, modelId, n, size, quality, outputFormat, outputCompression, billingMode, imageUrl, maskFile, signal, requestId) {
+  const debug = { request: null, response: null, error: null };
+
+  const apiModel = billingMode === 'per-image' ? 'gpt-image-2-c' : 'gpt-image-2';
+
+  // 从 URL 获取源图片为 Blob
+  let imageBlob;
+  try {
+    const resp = await fetch(imageUrl);
+    if (!resp.ok) throw new Error(`获取源图片失败: ${resp.status}`);
+    imageBlob = await resp.blob();
+  } catch (err) {
+    debug.error = `无法加载源图片: ${err.message}`;
+    throw new Error(debug.error);
+  }
+
+  // 推断源图扩展名
+  let imageExt = 'png';
+  const urlMatch = imageUrl.match(/\.(\w+)(?:\?|$)/);
+  if (urlMatch) imageExt = urlMatch[1] === 'jpeg' ? 'jpg' : urlMatch[1];
+  const mimeMatch = imageUrl.match(/data:image\/(\w+);/);
+  if (mimeMatch) imageExt = mimeMatch[1] === 'jpeg' ? 'jpg' : mimeMatch[1];
+
+  // 构建 FormData
+  const fd = new FormData();
+  fd.append('image', imageBlob, `source.${imageExt}`);
+  fd.append('prompt', prompt);
+  fd.append('model', apiModel);
+  fd.append('n', String(n || 1));
+  fd.append('size', size || 'auto');
+
+  if (quality) {
+    fd.append('quality', quality);
+  }
+  if (outputFormat) {
+    fd.append('output_format', outputFormat);
+  }
+  if (outputCompression != null && (outputFormat === 'jpeg' || outputFormat === 'webp')) {
+    fd.append('output_compression', String(outputCompression));
+  }
+
+  // 可选的 mask 文件
+  if (maskFile) {
+    let maskName = 'mask.png';
+    if (maskFile.name) {
+      maskName = maskFile.name;
+    } else if (maskFile.type === 'image/png') {
+      maskName = 'mask.png';
+    } else if (maskFile.type === 'image/jpeg') {
+      maskName = 'mask.jpg';
+    }
+    fd.append('mask', maskFile, maskName);
+  }
+
+  const url = '/api/generate/gpt-image-edit';
+
+  debug.request = {
+    url,
+    method: 'POST',
+    headers: { 'Content-Type': 'multipart/form-data' },
+    body: { prompt, model: apiModel, n, size, quality, outputFormat, outputCompression, hasImage: true, hasMask: !!maskFile },
+  };
+
+  console.group('%c📤 GPT Image 2 Edit API 请求', 'color:#10B981;font-weight:bold');
+  console.log('URL:', url);
+  console.log('Model:', apiModel, `(app: ${modelId})`);
+  console.log('Prompt:', prompt);
+  console.log('Size:', size, '· N:', n, '· Quality:', quality, '· Format:', outputFormat);
+  console.log('Source image:', imageUrl ? imageUrl.substring(0, 80) + '...' : 'none');
+  console.log('Mask:', maskFile ? `${maskFile.name || 'unnamed'} (${maskFile.size} bytes)` : 'none');
+  console.groupEnd();
+
+  const MAX_RETRIES = 3;
+  let response;
+  let attempt = 0;
+
+  while (attempt <= MAX_RETRIES) {
+    if (attempt > 0) {
+      const waitMs = Math.pow(2, attempt - 1) * 1000;
+      console.log(`%c⏳ 指数退让重试 #${attempt}, 等待 ${waitMs / 1000}s...`, 'color:#F2B33D');
+      await new Promise(r => setTimeout(r, waitMs));
+    }
+    try {
+      response = await fetch(url, {
+        method: 'POST',
+        headers: { 'X-Request-ID': requestId || '' },
+        body: fd,
+        signal: signal || null,
+      });
+    } catch (fetchErr) {
+      if (fetchErr.name === 'AbortError') {
+        debug.error = '已取消';
+        console.log('%c⏹️ 请求已取消 (AbortError)', 'color:#F59E0B');
+        throw fetchErr;
+      }
+      if (attempt >= MAX_RETRIES) {
+        debug.error = `网络错误 (已重试${MAX_RETRIES}次): ${fetchErr.message}`;
+        console.error('%c❌ 网络请求最终失败', 'color:#EF4444;font-weight:bold', fetchErr);
+        throw new Error(debug.error);
+      }
+      console.warn(`%c⚠️ 网络错误, 尝试 ${attempt + 1}/${MAX_RETRIES + 1}: ${fetchErr.message}`, 'color:#F2B33D');
+      attempt++;
+      continue;
+    }
+
+    if (!response.ok) {
+      let retryReason = null;
+      if (response.status === 429) {
+        retryReason = '429';
+      } else if (response.status >= 500) {
+        retryReason = `${response.status}`;
+      } else if (response.status === 400) {
+        try {
+          const clone = response.clone();
+          const errData = await clone.json();
+          if (/high load/i.test(errData?.error?.message || '')) {
+            retryReason = '400(high load)';
+          }
+        } catch (e) { /* ignore */ }
+      }
+
+      if (retryReason && attempt < MAX_RETRIES) {
+        const waitMs = Math.pow(2, attempt) * 1000;
+        console.warn(`%c⚠️ ${retryReason} 重试 ${attempt + 1}/${MAX_RETRIES + 1}, 等待 ${waitMs / 1000}s`, 'color:#F2B33D');
+        attempt++;
+        continue;
+      }
+
+      const errText = await response.text();
+      let errData;
+      try { errData = JSON.parse(errText); } catch (e) { errData = errText; }
+      let rawMsg = errData?.error?.message || `HTTP ${response.status}`;
+      if (/invalid.*token/i.test(rawMsg)) {
+        rawMsg = '令牌不可用，请检查余额或是否正确！';
+      } else if (/high load/i.test(rawMsg)) {
+        rawMsg = '模型过载，请稍后重试';
+      }
+      debug.error = rawMsg;
+      debug.response = { status: response.status, body: errData };
+      console.group('%c❌ GPT Image Edit API 返回错误', 'color:#EF4444;font-weight:bold');
+      console.log('Status:', response.status, '· 共尝试', attempt + 1, '次');
+      console.log('Response:', sanitizeLog(errData));
+      console.groupEnd();
+      throw new Error(debug.error);
+    }
+    break;
+  }
+
+  const data = await response.json();
+  debug.response = data;
+
+  if (data.error) {
+    debug.error = data.error.message || String(data.error);
+    throw new Error(debug.error);
+  }
+
+  // ⚠️ return 前的代码切勿调用未定义函数，否则抛异常导致 return 永不执行，tile 为 error 状态
+  return {
+    url: data.image_url,
     tokens: 0,
     responseContent: null,
     debug,
@@ -546,7 +652,7 @@ const GPT_IMAGE_FORMATS = [
 ];
 
 // GPT Image 2 自定义尺寸约束校验
-// 规则：16px倍数 · 3:1宽高比 · 65万~829万像素 · 单边≤3840
+// 规则：16px倍数 · 3:1宽高比 · 105万~829万像素（≥1K） · 单边≤3840
 function clampGptSize(w, h) {
   for (let i = 0; i < 3; i++) {
     w = Math.max(16, Math.min(3840, w));
@@ -560,8 +666,8 @@ function clampGptSize(w, h) {
       else h = Math.round((w * 3) / 16) * 16;
     }
     const pixels = w * h;
-    if (pixels < 655360) {
-      const scale = Math.sqrt(655360 / pixels);
+    if (pixels < 1048576) { // 1K = 1024×1024，低于此值 API 不保证精确尺寸
+      const scale = Math.sqrt(1048576 / pixels);
       w = Math.round((w * scale) / 16) * 16;
       h = Math.round((h * scale) / 16) * 16;
     } else if (pixels > 8294400) {
@@ -590,6 +696,16 @@ function getGptSizeDims(gptSize, customW, customH) {
   if (gptSize === 'auto') return null;
   if (gptSize === 'custom') return { w: customW || 1024, h: customH || 1024 };
   return MAP[gptSize] || null;
+}
+
+// 测量图片实际输出尺寸（用于纠正 API 未严格遵循自定义尺寸的情况）
+function getImageDims(url) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => resolve({ w: img.naturalWidth, h: img.naturalHeight });
+    img.onerror = () => resolve(null);
+    img.src = url;
+  });
 }
 
 // ---------- 批量模式 ----------
@@ -737,6 +853,14 @@ function getOutputDims(aspectId, resolutionId) {
   return { w, h };
 }
 
+// 从 "W×H" 字符串解析尺寸（GPT Image 2 实际输出或自定义分辨率）
+function parseResolutionDims(resolution) {
+  if (!resolution || typeof resolution !== 'string') return null;
+  const m = resolution.match(/^(\d+)[×x](\d+)$/);
+  if (m) return { w: parseInt(m[1], 10), h: parseInt(m[2], 10) };
+  return null;
+}
+
 
 // ---------- 图标 (lucide-style inline SVGs) ----------
 const Icon = ({ name, size = 18, className = '' }) => {
@@ -815,14 +939,14 @@ function ResolutionSegment({ resolution, setResolution, model }) {
 function BillingSegment({ billingMode, setBillingMode, hidePerUse }) {
   return (
     <div className="seg">
+      <button className={`seg-item ${billingMode === 'per-image' ? 'active' : ''}`} onClick={() => setBillingMode('per-image')}>
+        按张计费
+      </button>
       {!hidePerUse && (
       <button className={`seg-item ${billingMode === 'per-use' ? 'active' : ''}`} onClick={() => setBillingMode('per-use')}>
         按量计费
       </button>
       )}
-      <button className={`seg-item ${billingMode === 'per-image' ? 'active' : ''}`} onClick={() => setBillingMode('per-image')}>
-        按张计费
-      </button>
     </div>
   );
 }
@@ -1013,6 +1137,16 @@ function App() {
   const [gptCustomH, setGptCustomH] = useState(1024);
   const [gptCustomWStr, setGptCustomWStr] = useState('1024');
   const [gptCustomHStr, setGptCustomHStr] = useState('1024');
+  const [gptMask, setGptMask] = useState(null);       // 编辑蒙版 File（编辑模式 + 非编辑模式通用）
+  const [gptMaskUrl, setGptMaskUrl] = useState(null);  // 蒙版预览 data URL
+
+  // 离开 GPT 模型或清空参考图时，清除蒙版
+  useEffect(() => {
+    if (model !== 'gpt2' || images.length === 0) {
+      setGptMask(null);
+      setGptMaskUrl(null);
+    }
+  }, [model, images.length]);
 
   // 切换模型时：若当前 aspect / resolution 在新模型下不可用，clamp 到合法值
   // Nano Banana 固定为按张计费
@@ -1031,11 +1165,19 @@ function App() {
   const [toast, setToast] = useState('');
   const [galleryView, setGalleryView] = useState('grid'); // 'grid' | 'date'
   const [lightbox, setLightbox] = useState(null); // { url, prompt, model, resolution, aspect, outDims, elapsed, time, tokens, isEdit, originalPrompt } or null
+  const [imgZoom, setImgZoom] = useState(1);
+  const [imgPan, setImgPan] = useState({ x: 0, y: 0 });
+  const [imgDragging, setImgDragging] = useState(false);
+  const imgDragRef = useRef(null);
+  const imgWrapRef = useRef(null);
+  const imgZoomRef = useRef(imgZoom);
+  const handleImgWheelRef = useRef(null);
   const [dragging, setDragging] = useState(false);
   const [tick, setTick] = useState(0); // 每秒递增，驱动 loading tile 计时刷新
   const [editSource, setEditSource] = useState(null); // { gen, tile } — 编辑模式：恢复所有参数
   const [paramsPanelPos, setParamsPanelPos] = useState({ top: 0, left: 0 });
   const fileInputRef = useRef(null);
+  const maskInputRef = useRef(null);
   const textareaRef = useRef(null);
   const paramsPillRef = useRef(null);
   const paramsPanelRef = useRef(null);
@@ -1424,9 +1566,23 @@ function App() {
         const ctrl = controllers.find(ct => ct.tileId === tile.id);
         try {
           const isGpt = gen.modelId === 'gpt2';
-          const result = isGpt
+          const gptSizeStr = gen.gptSize === 'custom' ? `${gen.gptCustomW}x${gen.gptCustomH}` : gen.gptSize;
+          // GPT 图生图：显式编辑模式用 parentImageUrl，上传参考图时取第一张作为底图
+          const gptSourceUrl = gen.isEdit
+            ? gen.parentImageUrl
+            : (gen.refs.length > 0 ? gen.refs[0].url : null);
+          // GPT 蒙版：编辑模式或有参考图时均可使用
+          const gptEditMask = (gen.isEdit || gen.refs.length > 0) ? gptMask : null;
+          const result = isGpt && gptSourceUrl
+            ? await callGptImageEdit(
+                singlePrompt, gen.modelId, gen.count || 1, gptSizeStr, gen.gptQuality,
+                gen.gptFormat, gen.gptCompression, gen.billingMode,
+                gptSourceUrl, gptEditMask,
+                ctrl?.abortController?.signal, ctrl?.requestId
+              )
+            : isGpt
             ? await callGptImageGeneration(
-                singlePrompt, gen.modelId, gen.count || 1, gen.gptSize, gen.gptQuality,
+                singlePrompt, gen.modelId, gen.count || 1, gptSizeStr, gen.gptQuality,
                 gen.gptFormat, gen.gptCompression, gen.billingMode,
                 (partialB64) => {
                   const partialUrl = `data:image/${gen.gptFormat || 'png'};base64,${partialB64}`;
@@ -1443,10 +1599,11 @@ function App() {
               );
           setGenerations(prev => prev.map(g => {
             if (g.id !== genId) return g;
-            return {
+            const updated = {
               ...g,
               tiles: g.tiles.map(t => t.id === tile.id ? { ...t, status: 'done', url: result.url, tokens: result.tokens, responseContent: result.responseContent, debug: result.debug } : t),
             };
+            return updated;
           }));
         } catch (err) {
           if (err.name === 'AbortError') {
@@ -1671,6 +1828,7 @@ function App() {
       const data = await res.json();
       // 保存成功后，将 tile URL 从 data URL 替换为服务端路径，确保右键另存为格式正确
       if (data.filenames && data.filenames.length > 0) {
+        const firstLocalUrl = `/api/images/${data.filenames[0]}`;
         setGenerations(prev => prev.map(g => {
           if (g.id !== gen.id) return g;
           return {
@@ -1684,6 +1842,18 @@ function App() {
             }),
           };
         }));
+        // 测量实际图片尺寸，纠正 GPT Image 2 未严格遵循自定义分辨率的情况
+        // 注意：仅对 GPT 模型更新 resolution/outDims，Gemini 的 resolution ID 用于 re-run 不可覆盖
+        if (gen.modelId === 'gpt2') {
+          getImageDims(firstLocalUrl).then(actual => {
+            if (actual && actual.w && actual.h) {
+              setGenerations(prev => prev.map(g => {
+                if (g.id !== gen.id) return g;
+                return { ...g, outDims: actual, resolution: `${actual.w}×${actual.h}` };
+              }));
+            }
+          });
+        }
       }
     } catch (e) {
       console.warn('保存历史失败:', e.message);
@@ -1749,6 +1919,9 @@ function App() {
     if (gen.gptCustomW) { setGptCustomW(gen.gptCustomW); setGptCustomWStr(String(gen.gptCustomW)); }
     if (gen.gptCustomH) { setGptCustomH(gen.gptCustomH); setGptCustomHStr(String(gen.gptCustomH)); }
 
+    setGptMask(null);
+    setGptMaskUrl(null);
+
     setEditSource({
       gen,
       tile,
@@ -1792,6 +1965,85 @@ function App() {
     if (navigator.clipboard) navigator.clipboard.writeText(text).catch(()=>{});
     showToast('提示词已复制');
   };
+
+  // Lightbox 图片缩放与拖拽
+  const clampImgPan = (zoom, pan) => {
+    const wrap = imgWrapRef.current;
+    const img = wrap?.querySelector('img');
+    if (!wrap || !img) return pan;
+    const baseW = img.clientWidth;
+    const baseH = img.clientHeight;
+    const wrapW = wrap.clientWidth;
+    const wrapH = wrap.clientHeight;
+    const maxX = Math.max(0, (baseW * zoom - wrapW) / 2);
+    const maxY = Math.max(0, (baseH * zoom - wrapH) / 2);
+    return {
+      x: Math.max(-maxX, Math.min(maxX, pan.x)),
+      y: Math.max(-maxY, Math.min(maxY, pan.y)),
+    };
+  };
+
+  // 切换图片时重置缩放
+  useEffect(() => {
+    setImgZoom(1);
+    setImgPan({ x: 0, y: 0 });
+  }, [lightbox?.url]);
+
+  const handleImgWheel = (e) => {
+    e.preventDefault();
+    const factor = e.deltaY > 0 ? 1 / 1.15 : 1.15;
+    const prevZoom = imgZoomRef.current;
+    const newZoom = Math.min(10, Math.max(1, prevZoom * factor));
+    if (newZoom === prevZoom) return;
+    setImgZoom(newZoom);
+    setImgPan(prev => clampImgPan(newZoom, prev));
+  };
+
+  const handleImgMouseDown = (e) => {
+    if (imgZoom <= 1) return;
+    e.preventDefault();
+    setImgDragging(true);
+    imgDragRef.current = {
+      startX: e.clientX,
+      startY: e.clientY,
+      panX: imgPan.x,
+      panY: imgPan.y,
+    };
+  };
+
+  useEffect(() => {
+    if (!imgDragging) return;
+    const handleMove = (e) => {
+      const ref = imgDragRef.current;
+      if (!ref) return;
+      setImgPan(clampImgPan(imgZoom, {
+        x: ref.panX + (e.clientX - ref.startX),
+        y: ref.panY + (e.clientY - ref.startY),
+      }));
+    };
+    const handleUp = () => setImgDragging(false);
+    window.addEventListener('mousemove', handleMove);
+    window.addEventListener('mouseup', handleUp);
+    return () => {
+      window.removeEventListener('mousemove', handleMove);
+      window.removeEventListener('mouseup', handleUp);
+    };
+  }, [imgDragging, imgZoom]);
+
+  // 保持 imgZoomRef 与 handleImgWheelRef 为最新值，避免闭包过期
+  useEffect(() => { imgZoomRef.current = imgZoom; }, [imgZoom]);
+  useEffect(() => { handleImgWheelRef.current = handleImgWheel; });
+
+  // 用原生事件注册 wheel，避免 React passive 模式下 preventDefault 报错
+  // lightbox 是条件渲染的，必须等它打开后 imgWrapRef 才有值
+  useEffect(() => {
+    const wrap = imgWrapRef.current;
+    if (!wrap) return;
+    const handler = (e) => handleImgWheelRef.current(e);
+    wrap.addEventListener('wheel', handler, { passive: false });
+    return () => wrap.removeEventListener('wheel', handler);
+  }, [lightbox]);
+
   // 页面加载时从服务端恢复历史（分页加载）
   useEffect(() => {
     (async () => {
@@ -1812,7 +2064,7 @@ function App() {
             aspect: item.aspect || '',
             aspectStyle: aspectPreset ? { aspectRatio: `${aspectPreset.w} / ${aspectPreset.h}` } : undefined,
             resolution: item.resolution || '',
-            outDims: getOutputDims(item.aspect, item.resolution),
+            outDims: getOutputDims(item.aspect, item.resolution) || parseResolutionDims(item.resolution),
             model: item.model || '',
             modelShort: item.model?.includes('GPT') ? 'GPT2' : item.model?.includes('2') ? 'v2' : 'Pro',
             modelId: item.model?.includes('GPT') ? 'gpt2' : item.model?.includes('2') ? 'v2' : 'pro',
@@ -1887,6 +2139,25 @@ function App() {
                   onClick={() => fileInputRef.current?.click()} aria-label="添加参考图">
                   <Icon name="plus" size={20} />
                 </button>
+              )}
+              {/* GPT Image 2 蒙版上传（非编辑模式） */}
+              {model === 'gpt2' && images.length > 0 && (
+                gptMaskUrl ? (
+                  <div className="thumb" style={{ borderColor: 'var(--warning, #F2B33D)' }}>
+                    <img src={gptMaskUrl} alt="mask" style={{cursor:'zoom-in'}} onClick={() => setLightbox({ url: gptMaskUrl })} />
+                    <button className="thumb-remove" onClick={() => { setGptMask(null); setGptMaskUrl(null); }} aria-label="移除蒙版">
+                      <Icon name="close" size={11} />
+                    </button>
+                  </div>
+                ) : (
+                  <button className="thumb"
+                    style={{ background: 'var(--surface-2)', border: '1px dashed var(--line-strong)', color: 'var(--fg-3)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                    onClick={() => maskInputRef.current?.click()}
+                    title="添加蒙版（可选，用于局部编辑）"
+                    aria-label="添加蒙版">
+                    <span style={{ fontSize: 11 }}>蒙版</span>
+                  </button>
+                )
               )}
             </div>
           )}
@@ -2005,6 +2276,23 @@ function App() {
               <div className="thumb" style={{ borderColor: 'var(--accent)' }}>
                 <img src={editSource.tile.url} alt="" style={{cursor:'zoom-in'}} onClick={() => setLightbox({ url: editSource.tile.url })} />
               </div>
+              {/* 蒙版缩略图或上传按钮 */}
+              {gptMaskUrl ? (
+                <div className="thumb" style={{ borderColor: 'var(--warning, #F2B33D)' }}>
+                  <img src={gptMaskUrl} alt="mask" style={{cursor:'zoom-in'}} onClick={() => setLightbox({ url: gptMaskUrl })} />
+                  <button className="thumb-remove" onClick={() => { setGptMask(null); setGptMaskUrl(null); }} aria-label="移除蒙版">
+                    <Icon name="close" size={11} />
+                  </button>
+                </div>
+              ) : (
+                <button className="thumb"
+                  style={{ background: 'var(--surface-2)', border: '1px dashed var(--line-strong)', color: 'var(--fg-3)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                  onClick={() => maskInputRef.current?.click()}
+                  title="添加蒙版（可选）"
+                  aria-label="添加蒙版">
+                  <span style={{ fontSize: 11 }}>蒙版</span>
+                </button>
+              )}
               <div style={{ display:'flex',flexDirection:'column',justifyContent:'center',gap:2 }}>
                 <span style={{ fontSize:12,fontWeight:500,color:'var(--fg-1)' }}>编辑模式</span>
                 <span style={{ fontSize:11,color:'var(--fg-3)',maxWidth:200,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap' }}>
@@ -2083,7 +2371,7 @@ function App() {
                                 <span style={{ color: 'var(--fg-3)', fontSize: 12 }}>×</span>
                                 <input type="number" className="custom-size-input" value={gptCustomHStr} onChange={e => setGptCustomHStr(e.target.value)} onBlur={() => { const w = gptCustomWStr === '' ? 1024 : Number(gptCustomWStr); const h = gptCustomHStr === '' ? 1024 : Number(gptCustomHStr); const c = clampGptSize(w, h); setGptCustomW(c.w); setGptCustomH(c.h); setGptCustomWStr(String(c.w)); setGptCustomHStr(String(c.h)); }} style={{ width: 80, padding: '6px 8px', background: 'var(--bg-raised)', border: 'var(--border-default) solid var(--line-1)', borderRadius: 'var(--radius-1)', color: 'var(--fg-1)', fontSize: 12, fontFamily: 'var(--font-mono)', outline: 'none' }} />
                               </div>
-                              <div style={{ color: 'var(--fg-3)', fontSize: 11, marginTop: 4 }}>16px倍数 · 3:1宽高比 · 65万~829万像素</div>
+                              <div style={{ color: 'var(--fg-3)', fontSize: 11, marginTop: 4 }}>16px倍数 · 3:1宽高比 · 105万~829万像素（≥1K）</div>
                             </div>
                           )}
                         </div>
@@ -2265,7 +2553,7 @@ function App() {
             </div>
             <div className="composer-bar-right">
               {editSource && (
-                <button className="tool-btn" onClick={() => { setEditSource(null); setPrompt(''); setImages([]); }}
+                <button className="tool-btn" onClick={() => { setEditSource(null); setPrompt(''); setImages([]); setGptMask(null); setGptMaskUrl(null); }}
                   style={{ background:'var(--surface-2)',marginRight:4 }}>
                   <Icon name="close" size={14} />
                   <span style={{fontSize:12}}>取消编辑</span>
@@ -2281,6 +2569,17 @@ function App() {
 
           <input ref={fileInputRef} type="file" accept="image/*" multiple style={{ display: 'none' }}
             onChange={(e) => { addImages(e.target.files); e.target.value = ''; }} />
+          <input ref={maskInputRef} type="file" accept="image/*" style={{ display: 'none' }}
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (file) {
+                setGptMask(file);
+                const reader = new FileReader();
+                reader.onload = (ev) => setGptMaskUrl(ev.target.result);
+                reader.readAsDataURL(file);
+              }
+              e.target.value = '';
+            }} />
         </div>
 
         {/* 画廊标签栏 */}
@@ -2484,7 +2783,7 @@ function App() {
                     <span style={{ color: 'var(--fg-3)', fontSize: 12 }}>×</span>
                     <input type="number" className="custom-size-input" value={gptCustomHStr} onChange={e => setGptCustomHStr(e.target.value)} onBlur={() => { const w = gptCustomWStr === '' ? 1024 : Number(gptCustomWStr); const h = gptCustomHStr === '' ? 1024 : Number(gptCustomHStr); const c = clampGptSize(w, h); setGptCustomW(c.w); setGptCustomH(c.h); setGptCustomWStr(String(c.w)); setGptCustomHStr(String(c.h)); }} style={{ width: 80, padding: '6px 8px', background: 'var(--bg-raised)', border: 'var(--border-default) solid var(--line-1)', borderRadius: 'var(--radius-1)', color: 'var(--fg-1)', fontSize: 12, fontFamily: 'var(--font-mono)', outline: 'none' }} />
                   </div>
-                  <div style={{ color: 'var(--fg-3)', fontSize: 11, marginTop: 4 }}>16px倍数 · 3:1宽高比 · 65万~829万像素</div>
+                  <div style={{ color: 'var(--fg-3)', fontSize: 11, marginTop: 4 }}>16px倍数 · 3:1宽高比 · 105万~829万像素（≥1K）</div>
                 </div>
               )}
             </div>
@@ -2596,7 +2895,24 @@ function App() {
               </button>
             </div>
             )}
-            <img className="lightbox-img" src={lightbox.url} alt="" />
+            <div
+              className="lightbox-img-wrap"
+              ref={imgWrapRef}
+              onMouseDown={handleImgMouseDown}
+              onDoubleClick={() => { setImgZoom(1); setImgPan({ x: 0, y: 0 }); }}
+              style={{ cursor: imgZoom > 1 ? (imgDragging ? 'grabbing' : 'grab') : 'default' }}
+            >
+              <img
+                className="lightbox-img"
+                src={lightbox.url}
+                alt=""
+                draggable={false}
+                style={{ transform: `translate(${imgPan.x}px, ${imgPan.y}px) scale(${imgZoom})` }}
+              />
+              {imgZoom !== 1 && (
+                <span className="lightbox-zoom-badge">{Math.round(imgZoom * 100)}%</span>
+              )}
+            </div>
             {lightbox.prompt && (
             <div className="lightbox-info">
               <div className="lightbox-meta">

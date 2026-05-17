@@ -26,10 +26,11 @@ import threading
 import requests
 from urllib.parse import urlparse, parse_qs
 
-HISTORY_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "output")
+APP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app")
+HISTORY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 THUMBS_DIR = os.path.join(HISTORY_DIR, "thumbs")
 PORT = 8080
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 
 # ---------- 路由 → 域名映射 ----------
 ROUTE_DOMAINS = {
@@ -42,6 +43,7 @@ ROUTE_DOMAINS = {
 O1KEY_BASE = "https://api.o1key.cn"
 O1KEY_API_KEY = os.environ.get("O1KEY_API_KEY", "")
 _CONFIGURED = False  # 用户是否已通过 API 设置面板保存过 Key
+O1KEY_DEBUG = os.environ.get("O1KEY_DEBUG", "") == "1"
 
 
 def load_config():
@@ -361,13 +363,15 @@ def poll_task(task_id, deadline, cancel_event=None):
 
 class BananaHandler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, directory=os.path.dirname(os.path.abspath(__file__)), **kwargs)
+        super().__init__(*args, directory=APP_DIR, **kwargs)
 
     def do_POST(self):
         if self.path == "/api/generate":
             self._handle_generate_sync()
         elif self.path == "/api/generate/gpt-image":
             self._handle_generate_gpt_image()
+        elif self.path == "/api/generate/gpt-image-edit":
+            self._handle_generate_gpt_image_edit()
         elif self.path == "/api/generate/async":
             self._handle_generate_async()
         elif self.path == "/api/cancel":
@@ -652,11 +656,12 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
 
             response = {
                 "image_url": image_url,
-                "debug": {
+            }
+            if O1KEY_DEBUG:
+                response["debug"] = {
                     "upstream_url": sync_url,
                     "upstream_body": req_body,
-                },
-            }
+                }
             print(f"[GENERATE-SYNC] 完成: {len(img_bytes)} bytes, {accumulated_mime}")
             try:
                 self._json(response)
@@ -766,32 +771,187 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
             err_text = resp.text[:500] if resp.text else ""
             print(f"[GPT-IMAGE] 请求失败 [{resp.status_code}]: {err_text}")
             resp.close()
-            self._json({"error": {"message": f"API 错误 [{resp.status_code}]: {err_text}"}}, resp.status_code)
+            err_msg = f"API 错误 [{resp.status_code}]: {err_text}"
+            try:
+                upstream = json.loads(err_text)
+                original = upstream.get("error", {}).get("message", "")
+                if original:
+                    err_msg = original
+            except Exception:
+                pass
+            self._json({"error": {"message": err_msg}}, resp.status_code)
             return
 
-        # 开始 SSE 代理：逐行转发 o1key 流到前端
-        print(f"[GPT-IMAGE] 开始 SSE 代理...")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
+        # 返回 JSON 响应（不使用 SSE 代理）
+        body_text = resp.content.decode('utf-8')
+        resp.close()
+        print(f"[GPT-IMAGE] 响应长度: {len(body_text)} bytes")
 
         try:
-            for line in resp.iter_lines(decode_unicode=True):
-                if line is None:
+            data = json.loads(body_text)
+        except json.JSONDecodeError:
+            self._json({"error": {"message": f"上游返回非 JSON: {body_text[:200]}"}}, 500)
+            return
+
+        # 提取图片 URL
+        img_url = ""
+        if data.get("data") and isinstance(data["data"], list) and len(data["data"]) > 0:
+            img = data["data"][0]
+            if img.get("url"):
+                img_url = img["url"]
+            elif img.get("b64_json"):
+                mime = output_format if output_format else "png"
+                img_url = f"data:image/{mime};base64,{img['b64_json']}"
+
+        if not img_url:
+            self._json({"error": {"message": "响应中未找到图片数据"}}, 500)
+            return
+
+        # 若为远程 URL，下载后存到本地，返回 localhost 路径
+        if img_url.startswith("http://") or img_url.startswith("https://"):
+            try:
+                print(f"[GPT-IMAGE] 下载结果图片: {img_url[:120]}...")
+                img_resp = requests.get(img_url, timeout=30)
+                img_resp.raise_for_status()
+                content_type = img_resp.headers.get("Content-Type", f"image/{output_format or 'png'}")
+                img_url = self._save_image_bytes(img_resp.content, content_type)
+                print(f"[GPT-IMAGE] 已存本地: {img_url}")
+            except Exception as e:
+                print(f"[GPT-IMAGE] 下载图片失败，保留原始 URL: {e}")
+
+        response = {
+            "image_url": img_url,
+        }
+        if O1KEY_DEBUG:
+            response["debug"] = {
+                "upstream_url": gpt_url,
+                "upstream_body": req_body,
+            }
+        self._json(response)
+        print(f"[GPT-IMAGE] 完成: {len(body_text)} bytes")
+
+    # ---------- 图片编辑 (GPT Image 2 — /v1/images/edits) ----------
+    def _handle_generate_gpt_image_edit(self):
+        """代理 GPT Image 2 图片编辑请求到 o1key /v1/images/edits（multipart/form-data）"""
+        try:
+            self._handle_generate_gpt_image_edit_inner()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            try:
+                self._json({"error": {"message": f"服务器内部错误: {e}"}}, 500)
+            except Exception:
+                pass
+
+    def _handle_generate_gpt_image_edit_inner(self):
+        content_type = self.headers.get("Content-Type", "")
+        content_length = int(self.headers.get("Content-Length", 0))
+
+        # 读取原始 multipart 字节（只读一次，保存以供重试）
+        raw_body = self.rfile.read(content_length)
+
+        edit_url = f"{O1KEY_BASE}/v1/images/edits"
+        print(f"[GPT-IMAGE-EDIT] POST {edit_url} ({content_length} bytes)")
+
+        hdrs = {
+            "Authorization": f"Bearer {O1KEY_API_KEY}",
+            "Content-Type": content_type,
+        }
+
+        # 重试循环
+        resp = None
+        for attempt in range(RETRY_MAX + 1):
+            try:
+                resp = requests.post(edit_url, headers=hdrs, data=raw_body, timeout=GEN_TIMEOUT)
+            except requests.exceptions.RequestException as e:
+                print(f"[GPT-IMAGE-EDIT] 请求失败: {e}")
+                self._json({"error": {"message": f"API 请求失败: {e}"}}, 500)
+                return
+
+            if attempt < RETRY_MAX:
+                should_retry = False
+                retry_reason = ""
+                if resp.status_code == 429:
+                    should_retry = True
+                    retry_reason = "429"
+                elif resp.status_code == 400:
+                    try:
+                        if "high load" in resp.text.lower():
+                            should_retry = True
+                            retry_reason = "400(high load)"
+                    except Exception:
+                        pass
+
+                if should_retry:
+                    delay = _calc_retry_delay(resp, attempt + 1)
+                    print(f"[GPT-IMAGE-EDIT] {retry_reason} 重试 {attempt + 1}/{RETRY_MAX}, 等待 {delay:.1f}s")
+                    resp.close()
+                    time.sleep(delay)
                     continue
-                self.wfile.write(f"{line}\n".encode("utf-8"))
-                self.wfile.flush()
-            # 发送结束标记
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
-            print(f"[GPT-IMAGE] 客户端已断开")
-        finally:
+            break
+
+        if resp.status_code != 200:
+            err_text = resp.text[:500] if resp.text else ""
+            print(f"[GPT-IMAGE-EDIT] 请求失败 [{resp.status_code}]: {err_text}")
             resp.close()
-            print(f"[GPT-IMAGE] SSE 代理结束")
+            err_msg = f"API 错误 [{resp.status_code}]: {err_text}"
+            try:
+                upstream = json.loads(err_text)
+                original = upstream.get("error", {}).get("message", "")
+                if original:
+                    err_msg = original
+            except Exception:
+                pass
+            self._json({"error": {"message": err_msg}}, resp.status_code)
+            return
+
+        body_text = resp.content.decode('utf-8')
+        resp.close()
+        print(f"[GPT-IMAGE-EDIT] 响应长度: {len(body_text)} bytes")
+
+        try:
+            data = json.loads(body_text)
+        except json.JSONDecodeError:
+            self._json({"error": {"message": f"上游返回非 JSON: {body_text[:200]}"}}, 500)
+            return
+
+        # 提取图片 URL（与 generations 端点同格式：data[0].url 或 data[0].b64_json）
+        img_url = ""
+        if data.get("data") and isinstance(data["data"], list) and len(data["data"]) > 0:
+            img = data["data"][0]
+            if img.get("url"):
+                img_url = img["url"]
+            elif img.get("b64_json"):
+                img_url = f"data:image/png;base64,{img['b64_json']}"
+
+        if not img_url:
+            self._json({"error": {"message": "响应中未找到图片数据"}}, 500)
+            return
+
+        # 若为远程 URL，下载后存到本地，返回 localhost 路径
+        if img_url.startswith("http://") or img_url.startswith("https://"):
+            try:
+                print(f"[GPT-IMAGE-EDIT] 下载结果图片: {img_url[:120]}...")
+                img_resp = requests.get(img_url, timeout=30)
+                img_resp.raise_for_status()
+                img_ct = img_resp.headers.get("Content-Type", "image/png")
+                img_url = self._save_image_bytes(img_resp.content, img_ct)
+                print(f"[GPT-IMAGE-EDIT] 已存本地: {img_url}")
+            except Exception as e:
+                print(f"[GPT-IMAGE-EDIT] 下载图片失败，保留原始 URL: {e}")
+
+        # 解析原始 multipart 请求体，供前端调试
+        upstream_body_debug = self._parse_multipart_debug(raw_body, content_type)
+        response = {
+            "image_url": img_url,
+        }
+        if O1KEY_DEBUG:
+            response["debug"] = {
+                "upstream_url": edit_url,
+                "upstream_body": upstream_body_debug,
+            }
+        self._json(response)
+        print(f"[GPT-IMAGE-EDIT] 完成: {len(body_text)} bytes")
 
     # ---------- 图片生成 (o1key 异步 API — 暂不使用，保留备用) ----------
     def _handle_generate_async(self):
@@ -976,7 +1136,6 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
             "base_url": O1KEY_BASE,
             "hasKey": bool(O1KEY_API_KEY),
             "configured": _CONFIGURED,
-            "apiKey": O1KEY_API_KEY or "",
             "keyPreview": ("***" + O1KEY_API_KEY[-8:]) if O1KEY_API_KEY else "",
         })
 
@@ -1043,6 +1202,18 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
         except Exception as e:
             self._json({"ok": False, "error": f"清除失败: {e}"}, 500)
 
+    def _is_sensitive_path(self, path):
+        """阻止访问敏感文件：.py .json .jsx 以及路径遍历"""
+        # 防止路径遍历
+        if '..' in path or '//' in path:
+            return True
+        # 阻止敏感扩展名
+        lower = path.lower()
+        for ext in ('.py', '.json', '.jsx'):
+            if lower.endswith(ext) or (ext in lower and '?' in lower):
+                return True
+        return False
+
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/":
@@ -1055,6 +1226,8 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
             self._list_images()
         elif parsed.path.startswith("/api/images/"):
             self._serve_image(parsed.path, parse_qs(parsed.query))
+        elif self._is_sensitive_path(parsed.path):
+            self._json({"error": "not found"}, 404)
         else:
             super().do_GET()
 
@@ -1073,6 +1246,85 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
 
     # ---------- 图片历史 ----------
+    def _save_image_bytes(self, img_bytes, mime):
+        """保存原始字节到 history 目录，生成缩略图，返回 /api/images/xxx 路径"""
+        ext = mime.split("/")[1] if "/" in mime else "png"
+        if ext == "jpeg":
+            ext = "jpg"
+        filename = f"{uuid.uuid4().hex}.{ext}"
+        filepath = os.path.join(HISTORY_DIR, filename)
+        os.makedirs(HISTORY_DIR, exist_ok=True)
+        with open(filepath, "wb") as f:
+            f.write(img_bytes)
+        # 生成缩略图
+        try:
+            from PIL import Image
+            os.makedirs(THUMBS_DIR, exist_ok=True)
+            img = Image.open(io.BytesIO(img_bytes))
+            img.thumbnail((400, 400), Image.Resampling.LANCZOS)
+            thumb_filename = f"{os.path.splitext(filename)[0]}.jpg"
+            thumb_path = os.path.join(THUMBS_DIR, thumb_filename)
+            if img.mode in ('RGBA', 'P'):
+                img = img.convert('RGB')
+            img.save(thumb_path, format='JPEG', quality=75)
+        except Exception:
+            pass
+        return f"/api/images/{filename}"
+
+    def _parse_multipart_debug(self, raw_body, content_type):
+        """解析 multipart/form-data 请求体，返回字段名和简要值（文本字段显示值，文件字段显示大小）"""
+        debug_info = {"_ct": content_type[:200]}
+        try:
+            # 从 Content-Type 提取 boundary
+            boundary = None
+            for part in content_type.split(";"):
+                part = part.strip()
+                if part.lower().startswith("boundary="):
+                    boundary = part.split("=", 1)[1].strip().strip('"').strip("'")
+                    break
+            if not boundary:
+                debug_info["_error"] = f"无法解析 boundary, parts={content_type.split(';')}"
+                return debug_info
+
+            boundary_bytes = boundary.encode("utf-8")
+            # 分割各个 part
+            parts = raw_body.split(b"--" + boundary_bytes)
+            for part in parts:
+                if not part or part == b"--" or part == b"--\r\n":
+                    continue
+                # 去掉末尾 \r\n
+                part = part.lstrip(b"\r\n").rstrip(b"\r\n")
+                # 分离头和体
+                header_end = part.find(b"\r\n\r\n")
+                if header_end < 0:
+                    continue
+                headers_bytes = part[:header_end]
+                body_bytes = part[header_end + 4:]
+                headers_text = headers_bytes.decode("utf-8", errors="replace")
+
+                # 提取 name 和 filename
+                name = None
+                filename = None
+                for hdr_line in headers_text.split("\r\n"):
+                    if hdr_line.lower().startswith("content-disposition:"):
+                        # Content-Disposition: form-data; name="image"; filename="foo.png"
+                        for attr in hdr_line.split(";"):
+                            attr = attr.strip()
+                            if attr.startswith("name="):
+                                name = attr.split("=", 1)[1].strip('"').strip("'")
+                            elif attr.startswith("filename="):
+                                filename = attr.split("=", 1)[1].strip('"').strip("'")
+                if not name:
+                    continue
+                if filename:
+                    debug_info[name] = f"[file: {filename}, {len(body_bytes)} bytes]"
+                else:
+                    val = body_bytes.decode("utf-8", errors="replace").strip()
+                    debug_info[name] = val
+        except Exception as e:
+            debug_info["_parse_error"] = str(e)
+        return debug_info
+
     def _save_base64_image(self, b64, mime):
         """保存 base64 图片到 history 目录，同时生成缩略图，返回文件名"""
         ext = mime.split("/")[1]
@@ -1100,6 +1352,16 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
             pass  # 缩略图生成失败不影响主流程
         return filename
 
+    # ═══════════════════════════════════════════════════════════════════
+    # 【新增模型必读】_save_images 是所有模型图片持久化的唯一入口。
+    # 传入的 item["url"] 必须是以下三种格式之一，否则图片不会被保存：
+    #   1. data:image/<mime>;base64,<data>   — base64 直接写入
+    #   2. http:// 或 https:// 远程 URL       — 下载后写入（如 GPT Image 2 的 R2 链接）
+    #   3. /api/images/<filename> 本地路径    — 已由 handler 保存到 output/，直接用文件名
+    #   4. 空字符串                            — 取消/失败记录，无图片
+    # 新增模型时，请确保其 handler 返回给前端的 image_url 属于上述四种格式。
+    # 如果上游返回了新格式的 URL，在此处新增对应的处理分支。
+    # ═══════════════════════════════════════════════════════════════════
     def _save_images(self):
         content_length = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(content_length))
@@ -1115,6 +1377,25 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
                 filename = self._save_base64_image(b64, mime)
             elif not data_url:
                 filename = None
+            elif data_url.startswith("http://") or data_url.startswith("https://"):
+                # 远程 URL（如 GPT Image 2 返回的 R2 链接），下载后保存到本地
+                try:
+                    print(f"[SAVE] 下载远程图片: {data_url[:120]}...")
+                    resp = requests.get(data_url, timeout=30)
+                    resp.raise_for_status()
+                    img_bytes = resp.content
+                    content_type = resp.headers.get("Content-Type", "image/png")
+                    mime = content_type.split(";")[0].strip()
+                    b64 = base64.b64encode(img_bytes).decode("utf-8")
+                    filename = self._save_base64_image(b64, mime)
+                    print(f"[SAVE] 远程图片已保存: {filename} ({len(img_bytes)} bytes)")
+                except Exception as e:
+                    print(f"[SAVE] 下载远程图片失败: {e}")
+                    filename = None
+            elif data_url.startswith("/api/images/"):
+                # 本地路径（已由 handler 保存到 output/），直接提取文件名
+                filename = os.path.basename(data_url)
+                print(f"[SAVE] 本地图片: {filename}")
             else:
                 continue
 
@@ -1240,13 +1521,13 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    os.chdir(APP_DIR)
     if len(sys.argv) > 1:
         PORT = int(sys.argv[1])
     if len(sys.argv) > 2:
         HISTORY_DIR = sys.argv[2]
         if not os.path.isabs(HISTORY_DIR):
-            HISTORY_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), HISTORY_DIR)
+            HISTORY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), HISTORY_DIR)
         THUMBS_DIR = os.path.join(HISTORY_DIR, "thumbs")
     print(f"o1key Image Server: http://localhost:{PORT}/home.html")
     print(f"API Base: {O1KEY_BASE}")
