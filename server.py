@@ -32,9 +32,9 @@
 import sys
 import io
 
-# 强制使用 UTF-8 编码（解决 Windows GBK 编码问题）
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+# 强制使用 UTF-8 编码 + 行缓冲（确保终端实时看到日志）
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', line_buffering=True)
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', line_buffering=True)
 
 import http.server
 from http.server import ThreadingHTTPServer
@@ -259,6 +259,26 @@ def truncate_base64(obj, max_len=40):
     return obj
 
 
+def _log_truncate(val, max_len=120):
+    """安全截断任意值用于日志输出，自动识别 data URL / base64 / 长字符串"""
+    if isinstance(val, str):
+        if val.startswith("data:image/"):
+            # data URL: 保留 MIME 前缀 + 前 60 字符 + 总长度
+            comma = val.find(",")
+            prefix = val[:comma] if comma > 0 else val[:80]
+            return f"{prefix},[…{len(val)} chars]"
+        if len(val) > 200 and re.match(r'^[A-Za-z0-9+/=]{100,}$', val):
+            return f"[base64, {len(val)} chars]"
+        if len(val) > max_len:
+            return val[:max_len] + f"…[{len(val)}]"
+        return val
+    if isinstance(val, (list, tuple)):
+        return [_log_truncate(v, max_len) for v in val]
+    if isinstance(val, dict):
+        return {k: _log_truncate(v, max_len) for k, v in val.items()}
+    return val
+
+
 def compress_image_to_target(img_bytes, mime_type, target_size):
     """缩放图片到目标大小（等比缩放，保留原格式画质）"""
     try:
@@ -394,6 +414,10 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=APP_DIR, **kwargs)
 
+    def log_message(self, format, *args):
+        """简化请求日志"""
+        print(f"[REQ] {self.command} {self.path}")
+
     def do_POST(self):
         if self.path == "/api/generate":
             self._handle_generate_sync()
@@ -476,7 +500,7 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
                 print(f"[REF] 上传本地图片到 R2: {len(img_bytes)/1024/1024:.1f}MB")
                 return upload_to_r2(b64, mime), mime
             else:
-                print(f"[REF] 使用外部 URL: {url[:80]}...")
+                print(f"[REF] 使用外部 URL")
                 return url, "image/png"
         else:
             b64 = img.get("data", "")
@@ -600,103 +624,129 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
 
         sync_url = f"{O1KEY_BASE}/v1/chat/completions"
 
-        print(f"[GENERATE-SYNC] POST (OpenAI chat) billing={billing} {sync_url}")
-        print(f"[GENERATE-SYNC] req_body: {json.dumps(truncate_base64(req_body), ensure_ascii=False)}")
-        tc = (generation_config or {}).get("thinkingConfig")
-        if tc:
-            print(f"[GENERATE-SYNC] thinkingConfig: {json.dumps(tc, ensure_ascii=False)}")
+        print(f"[GENERATE-SYNC] 开始请求 (billing={billing})")
 
         # 发送请求 (stream=True 逐块读取，避免上游 SSE 不关闭连接导致挂死)
         headers = {
             "Authorization": f"Bearer {O1KEY_API_KEY}",
             "Content-Type": "application/json",
+            "X-Accel-Buffering": "no",
+            "Cache-Control": "no-cache, no-transform",
         }
 
         STREAM_IDLE_TIMEOUT = 300  # 单块读取超时 (秒)
 
         resp = None
-        for attempt in range(RETRY_MAX + 1):
-            try:
-                resp = requests.post(sync_url, headers=headers, json=req_body,
-                                    stream=True, timeout=(30, STREAM_IDLE_TIMEOUT))
-            except requests.exceptions.RequestException as e:
-                print(f"[ERROR] 请求失败: {e}")
-                self._json({"error": {"message": f"API 请求失败: {e}"}}, 500)
-                return
-
-            if resp.status_code == 429 and attempt < RETRY_MAX:
-                delay = _calc_retry_delay(resp, attempt + 1)
-                print(f"[RETRY] 429 Too Many Requests, 第 {attempt + 1}/{RETRY_MAX} 次重试, 等待 {delay:.1f}s")
-                time.sleep(delay)
-                continue
-
-            break
-
-        if resp.status_code != 200:
-            err_text = resp.text[:500]
-            print(f"[ERROR] 请求失败 [{resp.status_code}]: {err_text}")
-            if resp.status_code in (401, 403):
-                self._json({"error": {"message": "令牌不可用，请检查余额或令牌是否正确"}}, resp.status_code)
-            elif resp.status_code == 503:
-                self._json({"error": {"message": "模型暂不可用，请稍后重试或检查分组"}}, resp.status_code)
-            else:
-                self._json({"error": {"message": f"API 错误 [{resp.status_code}]: {err_text}"}}, resp.status_code)
-            return
-
-        # 解析 OpenAI 流式 SSE 响应 (逐行读取，遇到 [DONE] 排空剩余 HTTP chunk 后结束)
-        # 格式: choices[].delta.content 拼接得到 "![image](data:image/...;base64,...)"
-        # 注意: 必须在 [DONE] 后调用 drain_conn() 排空剩余字节，
-        #       避免经过本地代理时连接处于脏状态，导致第二次请求返回 "Response ended prematurely"
         accumulated_content = ""
         line_count = 0
         done_seen = False
         try:
-            for line in resp.iter_lines(decode_unicode=True):
-                if not line:
-                    continue
+            for attempt in range(RETRY_MAX + 1):
+                if resp is not None:
+                    resp.close()
+                    resp = None
+                accumulated_content = ""
+                line_count = 0
+                done_seen = False
 
-                if line.startswith("data:"):
-                    line = line[5:].lstrip()
-
-                if not line:
-                    continue
-                if line == "[DONE]":
-                    done_seen = True
-                    print(f"[GENERATE-SYNC] 收到 [DONE]，已读 {line_count} 行，排空剩余 HTTP chunk...")
-                    try:
-                        resp.raw.drain_conn()
-                    except Exception as drain_err:
-                        print(f"[GENERATE-SYNC] drain_conn 异常（可忽略）: {drain_err}")
-                    break
-
+                print(f"[GENERATE-SYNC] 已连接 (attempt {attempt + 1}/{RETRY_MAX + 1})...")
+                t0 = time.time()
                 try:
-                    chunk = json.loads(line)
-                except json.JSONDecodeError:
+                    resp = requests.post(sync_url, headers=headers, json=req_body,
+                                        stream=True, timeout=(30, STREAM_IDLE_TIMEOUT))
+                except requests.exceptions.RequestException as e:
+                    print(f"[ERROR] 请求失败 ({time.time() - t0:.1f}s): {e}")
+                    self._json({"error": {"message": f"API 请求失败: {e}"}}, 500)
+                    return
+                print(f"[GENERATE-SYNC] 上游响应 status={resp.status_code} ({time.time() - t0:.1f}s)")
+
+                if resp.status_code == 429 and attempt < RETRY_MAX:
+                    delay = _calc_retry_delay(resp, attempt + 1)
+                    print(f"[RETRY] 429 Too Many Requests, 第 {attempt + 1}/{RETRY_MAX} 次重试, 等待 {delay:.1f}s")
+                    time.sleep(delay)
                     continue
 
-                line_count += 1
+                if resp.status_code != 200:
+                    err_text = resp.text[:500]
+                    print(f"[ERROR] 请求失败 [{resp.status_code}]: {err_text}")
+                    if resp.status_code in (401, 403):
+                        self._json({"error": {"message": "令牌不可用，请检查余额或令牌是否正确"}}, resp.status_code)
+                    elif resp.status_code == 503:
+                        self._json({"error": {"message": "模型暂不可用，请稍后重试或检查分组"}}, resp.status_code)
+                    else:
+                        self._json({"error": {"message": f"API 错误 [{resp.status_code}]: {err_text}"}}, resp.status_code)
+                    return
 
-                choices = chunk.get("choices", [])
-                for choice in choices:
-                    delta = choice.get("delta", {})
-                    content = delta.get("content", "")
-                    if content:
-                        accumulated_content += content
-        except requests.exceptions.ReadTimeout:
-            print(f"[GENERATE-SYNC] 流读取超时 ({STREAM_IDLE_TIMEOUT}s 无新数据, done={done_seen})")
-            if not accumulated_content:
-                self._json({"error": {"message": f"上游响应超时 ({STREAM_IDLE_TIMEOUT}s 无数据)"}}, 504)
-                return
-        except (requests.exceptions.ChunkedEncodingError,
-                requests.exceptions.ConnectionError) as e:
-            print(f"[GENERATE-SYNC] 流读取连接异常 (done={done_seen}): {type(e).__name__}: {e}")
-            if not accumulated_content:
-                self._json({"error": {"message": f"上游连接中断: {e}"}}, 502)
-                return
+                # 解析 OpenAI 流式 SSE 响应
+                # 注意: 必须在 [DONE] 后调用 drain_conn() 排空剩余字节，
+                #       避免经过本地代理时连接处于脏状态，导致下一次请求返回 "Response ended prematurely"
+                first_chunk = True
+                t_stream_start = time.time()
+                stream_ok = True
+                try:
+                    for line in resp.iter_lines(decode_unicode=True, chunk_size=65536):
+                        if first_chunk and line:
+                            first_chunk = False
+                            print(f"[GENERATE-SYNC] 收到首个 SSE chunk ({time.time() - t_stream_start:.1f}s)")
+                        if not line:
+                            continue
+                        if line.startswith("data:"):
+                            line = line[5:].lstrip()
+                        if not line:
+                            continue
+                        if line == "[DONE]":
+                            done_seen = True
+                            print(f"[GENERATE-SYNC] 收到 [DONE] ({line_count} 行, {time.time() - t_stream_start:.1f}s)")
+                            try:
+                                resp.raw.drain_conn()
+                            except Exception as drain_err:
+                                print(f"[GENERATE-SYNC] drain_conn 异常（可忽略）: {drain_err}")
+                            break
+                        try:
+                            chunk = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        line_count += 1
+                        choices = chunk.get("choices", [])
+                        for choice in choices:
+                            delta = choice.get("delta", {})
+                            content = delta.get("content", "")
+                            if content:
+                                prev_mb = len(accumulated_content) // 5_000_000
+                                accumulated_content += content
+                                cur_mb = len(accumulated_content) // 5_000_000
+                                if cur_mb > prev_mb:
+                                    print(f"[GENERATE-SYNC] 进度: {len(accumulated_content) / 1_000_000:.1f}MB ({time.time() - t_stream_start:.1f}s)")
+                except requests.exceptions.ReadTimeout:
+                    stream_ok = False
+                    print(f"[GENERATE-SYNC] 流读取超时 ({STREAM_IDLE_TIMEOUT}s 无新数据, done={done_seen})")
+                    if accumulated_content:
+                        break  # 有部分内容，继续处理
+                    if attempt < RETRY_MAX:
+                        print(f"[GENERATE-SYNC] 无数据，准备重试...")
+                        continue
+                    self._json({"error": {"message": f"上游响应超时 ({STREAM_IDLE_TIMEOUT}s 无数据)"}}, 504)
+                    return
+                except (requests.exceptions.ChunkedEncodingError,
+                        requests.exceptions.ConnectionError) as e:
+                    stream_ok = False
+                    print(f"[GENERATE-SYNC] 流读取连接异常 (done={done_seen}): {type(e).__name__}: {e}")
+                    if accumulated_content:
+                        print(f"[GENERATE-SYNC] 已有 {len(accumulated_content)} chars 内容，使用部分数据")
+                        break  # CDN 断开但已有数据，尝试提取图片
+                    if attempt < RETRY_MAX:
+                        print(f"[GENERATE-SYNC] 无数据 (CDN 超时?)，准备重试...")
+                        continue
+                    self._json({"error": {"message": f"上游连接中断: {e}"}}, 502)
+                    return
+
+                break  # stream_ok or partial content
+
         finally:
-            resp.close()
+            if resp is not None:
+                resp.close()
 
-        print(f"[GENERATE-SYNC] 流完成: {line_count} 行, done_seen={done_seen}, content={len(accumulated_content)} chars")
+        print(f"[GENERATE-SYNC] 流完成: {line_count} 行, {len(accumulated_content)} chars")
 
         # 从 Markdown 图片语法中提取 data URL: ![image](data:image/jpeg;base64,...)
         idx = accumulated_content.find("data:image/")
@@ -706,28 +756,31 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
                 raw = accumulated_content[idx:end_idx]
             else:
                 raw = accumulated_content[idx:]
-            # 移除 base64 中可能的空白字符
-            image_url = re.sub(r'\s+', '', raw)
-            mime_match = re.match(r'data:(image/\w+);base64,', image_url)
+            mime_match = re.match(r'data:(image/\w+);base64,', raw)
             accumulated_mime = mime_match.group(1) if mime_match else "image/png"
-            b64_data = image_url.split(",", 1)[-1] if "," in image_url else ""
+            b64_data = raw.split(",", 1)[-1] if "," in raw else ""
+            # 解码 base64 → 保存到本地 → 返回本地路径（避免 28MB JSON 响应）
             try:
+                t_decode = time.time()
                 img_bytes = base64.b64decode(b64_data)
-                print(f"[GENERATE-SYNC] 完成: {len(img_bytes)} bytes, {accumulated_mime}")
+                local_path = self._save_image_bytes(img_bytes, accumulated_mime)
+                print(f"[GENERATE-SYNC] 已保存: {local_path}")
             except Exception as e:
-                print(f"[GENERATE-SYNC] base64 解码失败: {e}")
+                print(f"[GENERATE-SYNC] base64 解码/保存失败: {e}")
+                self._json({"error": {"message": f"图片保存失败: {e}"}}, 500)
+                return
 
             response = {
-                "image_url": image_url,
+                "image_url": local_path,
             }
             if O1KEY_DEBUG:
                 response["debug"] = {
                     "upstream_url": sync_url,
                     "upstream_body": req_body,
                 }
-            print(f"[GENERATE-SYNC] 完成: {len(img_bytes)} bytes, {accumulated_mime}")
             try:
                 self._json(response)
+                print(f"[GENERATE-SYNC] 响应已发送")
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 print(f"[GENERATE-SYNC] 客户端已断开, 响应未发送")
         else:
@@ -787,9 +840,7 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
             req_body["output_compression"] = output_compression
 
         gpt_url = f"{O1KEY_BASE}/v1/images/generations"
-
-        print(f"\n[GPT-IMAGE] POST {gpt_url}")
-        print(f"[GPT-IMAGE] req_body: {json.dumps(truncate_base64(req_body), ensure_ascii=False)}")
+        print(f"\n[GPT-IMAGE] 开始生成 model={model} n={n} size={size}")
 
         hdrs = {
             "Authorization": f"Bearer {O1KEY_API_KEY}",
@@ -886,7 +937,7 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
             self._json({"error": {"message": f"上游返回非 JSON: {body_text}"}}, 500)
             return
 
-        print(f"[GPT-IMAGE] SSE 流完成: {len(chunks)} chunks")
+        print(f"[GPT-IMAGE] 流完成: {len(chunks)} chunks")
 
         # 提取图片 URL
         img_url = ""
@@ -922,8 +973,9 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
                 "upstream_url": gpt_url,
                 "upstream_body": req_body,
             }
+        print(f"[GPT-IMAGE] 完成 → {_log_truncate(img_url)}")
         self._json(response)
-        print(f"[GPT-IMAGE] 完成: {len(body_text)} bytes")
+        print(f"[GPT-IMAGE] 响应已发送")
 
     # ---------- 图片编辑 (GPT Image 2 — /v1/images/edits) ----------
     def _handle_generate_gpt_image_edit(self):
@@ -946,7 +998,7 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
         raw_body = self.rfile.read(content_length)
 
         edit_url = f"{O1KEY_BASE}/v1/images/edits"
-        print(f"[GPT-IMAGE-EDIT] POST {edit_url} ({content_length} bytes)")
+        print(f"[GPT-IMAGE-EDIT] 开始编辑 ({content_length} bytes)")
 
         hdrs = {
             "Authorization": f"Bearer {O1KEY_API_KEY}",
@@ -1010,7 +1062,6 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
 
         body_text = resp.content.decode('utf-8')
         resp.close()
-        print(f"[GPT-IMAGE-EDIT] 响应长度: {len(body_text)} bytes")
 
         try:
             data = json.loads(body_text)
@@ -1053,8 +1104,9 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
                 "upstream_url": edit_url,
                 "upstream_body": upstream_body_debug,
             }
+        print(f"[GPT-IMAGE-EDIT] 完成 → {_log_truncate(img_url)}")
         self._json(response)
-        print(f"[GPT-IMAGE-EDIT] 完成: {len(body_text)} bytes")
+        print(f"[GPT-IMAGE-EDIT] 响应已发送")
 
     # ---------- 图片生成 (o1key 异步 API — 暂不使用，保留备用) ----------
     def _handle_generate_async(self):
@@ -1077,7 +1129,7 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
             self._json({"error": {"message": "请求体解析失败"}}, 400)
             return
 
-        print(f"\n[GENERATE-ASYNC] 请求: prompt={str(body.get('prompt',''))[:80]!r} model={body.get('model','')} size={body.get('size','')} refs={len(body.get('images') or ([body['image']] if body.get('image') else []))}")
+        print(f"\n[GENERATE-ASYNC] prompt={str(body.get('prompt',''))[:80]!r} model={body.get('model','')} size={body.get('size','')}")
 
         prompt = body.get("prompt")
         aspect_ratio = body.get("aspect_ratio")
@@ -1125,8 +1177,7 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
         elif len(image_urls) > 1:
             req_body["images"] = image_urls
 
-        print(f"[GENERATE-ASYNC] billing={billing} model={o1key_model} aspect={aspect_ratio} "
-              f"size={req_body['size']} refs={len(image_urls)} prompt={prompt[:60]}...")
+        print(f"[GENERATE-ASYNC] 提交任务 billing={billing} model={o1key_model} aspect={aspect_ratio} size={req_body['size']}")
 
         status, submit_result = o1key_request(
             "POST",
@@ -1193,7 +1244,7 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
                 "image_url": f"data:{content_type};base64,{b64_data}",
             }
 
-            print(f"[GENERATE-ASYNC] 完成: {task_id} → {len(img_bytes)} bytes, {content_type}")
+            print(f"[GENERATE-ASYNC] 完成: {task_id}")
             try:
                 self._json(response)
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
@@ -1239,6 +1290,7 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
             "base_url": O1KEY_BASE,
             "hasKey": bool(O1KEY_API_KEY),
             "configured": _CONFIGURED,
+            "apiKey": O1KEY_API_KEY or "",
             "keyPreview": (O1KEY_API_KEY[:5] + "****" + O1KEY_API_KEY[-4:]) if O1KEY_API_KEY else "",
         })
 
@@ -1253,6 +1305,8 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
 
         test_route = body.get("route", "global")
         test_key = body.get("apiKey", "").strip()
+        if not test_key:
+            test_key = O1KEY_API_KEY  # 未传新 key 则使用已保存的
         if not test_key:
             self._json({"ok": False, "error": "API Key 不能为空"})
             return
@@ -1285,6 +1339,8 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
 
         route = body.get("route", "global")
         api_key = body.get("apiKey", "").strip()
+        if not api_key:
+            api_key = O1KEY_API_KEY  # 未传新 key 则保留已保存的
         if not api_key:
             self._json({"ok": False, "error": "API Key 不能为空"}, 400)
             return
@@ -1708,7 +1764,7 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
             "Authorization": f"Bearer {O1KEY_API_KEY}",
             "Content-Type": "application/json",
         }
-        print(f"\n[CHAT] POST {chat_url} model={model} messages={len(messages)}")
+        print(f"\n[CHAT] 开始对话 model={model} messages={len(messages)}")
 
         STREAM_IDLE_TIMEOUT = 300
         try:
@@ -1788,7 +1844,7 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
             except Exception:
                 pass
 
-        print(f"[CHAT] 完成: relayed={relayed_lines} 行, done={done_seen}, client_alive={client_alive}")
+        print(f"[CHAT] 完成: {relayed_lines} 行")
 
     # ================================================================
     # 会话存储 (chats/{id}.json) — 文件即真相，前端只持 UI 偏好

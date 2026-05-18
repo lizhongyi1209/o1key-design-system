@@ -139,15 +139,6 @@ async function callGeminiImageGeneration(prompt, refImages, aspectRatio, modelId
     body: { ...requestBody, contents: [{ role: 'user', parts: parts.map(p => p.inlineData ? { inlineData: { mimeType: p.inlineData.mimeType, data: `[${p.inlineData.data.length} chars]` } } : p) }] },
   };
 
-  console.group('%c📤 Gemini 原生格式 API 请求 (via 本地代理 → o1key)', 'color:#F59E0B;font-weight:bold');
-  console.log('URL:', url);
-  console.log('Model:', apiModel, `(app: ${modelId})`);
-  console.log('Prompt:', prompt);
-  console.log('Aspect:', aspectRatio, '· Size:', toApiImageSize(resolution));
-  console.log('Ref images:', refImages.length);
-  console.log('Request Body:', sanitizeLog(requestBody));
-  console.groupEnd();
-
   // --- 请求（带指数退让重试） ---
   const MAX_RETRIES = 3;
   const FETCH_TIMEOUT = 300000; // 前端兜底超时 300s
@@ -183,14 +174,10 @@ async function callGeminiImageGeneration(prompt, refImages, aspectRatio, modelId
         console.error('%c❌ 请求超时', 'color:#EF4444;font-weight:bold');
         throw new Error(debug.error);
       }
-      if (attempt >= MAX_RETRIES) {
-        debug.error = `网络错误 (已重试${MAX_RETRIES}次): ${fetchErr.message}`;
-        console.error('%c❌ 网络请求最终失败', 'color:#EF4444;font-weight:bold', fetchErr);
-        throw new Error(debug.error);
-      }
-      console.warn(`%c⚠️ 网络错误, 尝试 ${attempt + 1}/${MAX_RETRIES + 1}: ${fetchErr.message}`, 'color:#F2B33D');
-      attempt++;
-      continue;
+      // 网络错误不重试（服务器断开等场景重试无意义）
+      debug.error = `网络错误: ${fetchErr.message}`;
+      console.error('%c❌ 网络请求失败', 'color:#EF4444;font-weight:bold', fetchErr);
+      throw new Error(debug.error);
     }
 
     if (response.status === 429 || response.status >= 500) {
@@ -220,25 +207,11 @@ async function callGeminiImageGeneration(prompt, refImages, aspectRatio, modelId
   if (!response.ok) {
     debug.response.body = data;
     debug.error = data?.error?.message || `HTTP ${response.status}`;
-    console.group('%c❌ API 返回错误', 'color:#EF4444;font-weight:bold');
-    console.log('Status:', response.status, '· 共尝试', attempt + 1, '次');
-    console.log('Response:', sanitizeLog(data));
-    console.groupEnd();
     throw new Error(debug.error);
   }
 
   debug.response.body = data;
 
-  console.group('%c✅ API 响应', 'color:#10B981;font-weight:bold');
-  console.log(`Status: ${response.status} · ${elapsed}ms · 尝试 ${attempt + 1} 次`);
-  console.log('Raw response:', sanitizeLog(data));
-  if (data.debug) {
-    console.group('%c🔍 上游真实请求', 'color:#8B5CF6;font-weight:bold');
-    console.log('URL:', data.debug.upstream_url);
-    console.log('Body:', data.debug.upstream_body);
-    console.groupEnd();
-  }
-  console.groupEnd();
 
   // 提取图片 URL（server.py 同步代理返回 data URL 格式）
   let imageUrl = null;
@@ -250,11 +223,8 @@ async function callGeminiImageGeneration(prompt, refImages, aspectRatio, modelId
 
   if (!imageUrl) {
     debug.error = '响应中未找到图片 URL';
-    console.warn('⚠️ 响应格式:', data);
     throw new Error('响应中未找到图片 URL');
   }
-
-  console.log('%c🖼️ 提取到图片 URL:', 'color:#10B981', sanitizeLog(imageUrl));
 
   return {
     url: imageUrl,
@@ -298,14 +268,6 @@ async function callGptImageGeneration(prompt, modelId, n, size, quality, outputF
     body: { ...requestBody },
   };
 
-  console.group('%c📤 GPT Image 2 API 请求', 'color:#10B981;font-weight:bold');
-  console.log('URL:', url);
-  console.log('Model:', requestBody.model, `(app: ${modelId})`);
-  console.log('Prompt:', prompt);
-  console.log('Size:', size, '· N:', n, '· Quality:', quality, '· Format:', outputFormat);
-  console.log('Request Body:', sanitizeLog(requestBody));
-  console.groupEnd();
-
   const MAX_RETRIES = 3;
   const FETCH_TIMEOUT = 300000;
   const startTime = performance.now();
@@ -340,14 +302,10 @@ async function callGptImageGeneration(prompt, modelId, n, size, quality, outputF
         console.error('%c❌ 请求超时', 'color:#EF4444;font-weight:bold');
         throw new Error(debug.error);
       }
-      if (attempt >= MAX_RETRIES) {
-        debug.error = `网络错误 (已重试${MAX_RETRIES}次): ${fetchErr.message}`;
-        console.error('%c❌ 网络请求最终失败', 'color:#EF4444;font-weight:bold', fetchErr);
-        throw new Error(debug.error);
-      }
-      console.warn(`%c⚠️ 网络错误, 尝试 ${attempt + 1}/${MAX_RETRIES + 1}: ${fetchErr.message}`, 'color:#F2B33D');
-      attempt++;
-      continue;
+      // 网络错误不重试（服务器断开等场景重试无意义）
+      debug.error = `网络错误: ${fetchErr.message}`;
+      console.error('%c❌ 网络请求失败', 'color:#EF4444;font-weight:bold', fetchErr);
+      throw new Error(debug.error);
     }
 
     if (!response.ok) {
@@ -384,10 +342,6 @@ async function callGptImageGeneration(prompt, modelId, n, size, quality, outputF
       }
       debug.error = rawMsg;
       debug.response = { status: response.status, body: errData };
-      console.group('%c❌ GPT Image API 返回错误', 'color:#EF4444;font-weight:bold');
-      console.log('Status:', response.status, '· 共尝试', attempt + 1, '次');
-      console.log('Response:', sanitizeLog(errData));
-      console.groupEnd();
       throw new Error(debug.error);
     }
     break;
@@ -403,9 +357,6 @@ async function callGptImageGeneration(prompt, modelId, n, size, quality, outputF
   }
 
   const elapsed = (performance.now() - startTime).toFixed(0);
-  console.log(`%c✅ GPT Image 完成: ${elapsed}ms`, 'color:#10B981');
-  console.log('Image URL:', data.image_url);
-
   return {
     url: data.image_url,
     tokens: 0,
@@ -483,15 +434,6 @@ async function callGptImageEdit(prompt, modelId, n, size, quality, outputFormat,
     body: { prompt, model: apiModel, n, size, quality, outputFormat, outputCompression, hasImage: true, hasMask: !!maskFile },
   };
 
-  console.group('%c📤 GPT Image 2 Edit API 请求', 'color:#10B981;font-weight:bold');
-  console.log('URL:', url);
-  console.log('Model:', apiModel, `(app: ${modelId})`);
-  console.log('Prompt:', prompt);
-  console.log('Size:', size, '· N:', n, '· Quality:', quality, '· Format:', outputFormat);
-  console.log('Source image:', imageUrl ? imageUrl.substring(0, 80) + '...' : 'none');
-  console.log('Mask:', maskFile ? `${maskFile.name || 'unnamed'} (${maskFile.size} bytes)` : 'none');
-  console.groupEnd();
-
   const MAX_RETRIES = 3;
   const FETCH_TIMEOUT = 300000;
   let response;
@@ -525,14 +467,10 @@ async function callGptImageEdit(prompt, modelId, n, size, quality, outputFormat,
         console.error('%c❌ 请求超时', 'color:#EF4444;font-weight:bold');
         throw new Error(debug.error);
       }
-      if (attempt >= MAX_RETRIES) {
-        debug.error = `网络错误 (已重试${MAX_RETRIES}次): ${fetchErr.message}`;
-        console.error('%c❌ 网络请求最终失败', 'color:#EF4444;font-weight:bold', fetchErr);
-        throw new Error(debug.error);
-      }
-      console.warn(`%c⚠️ 网络错误, 尝试 ${attempt + 1}/${MAX_RETRIES + 1}: ${fetchErr.message}`, 'color:#F2B33D');
-      attempt++;
-      continue;
+      // 网络错误不重试（服务器断开等场景重试无意义）
+      debug.error = `网络错误: ${fetchErr.message}`;
+      console.error('%c❌ 网络请求失败', 'color:#EF4444;font-weight:bold', fetchErr);
+      throw new Error(debug.error);
     }
 
     if (!response.ok) {
@@ -569,10 +507,6 @@ async function callGptImageEdit(prompt, modelId, n, size, quality, outputFormat,
       }
       debug.error = rawMsg;
       debug.response = { status: response.status, body: errData };
-      console.group('%c❌ GPT Image Edit API 返回错误', 'color:#EF4444;font-weight:bold');
-      console.log('Status:', response.status, '· 共尝试', attempt + 1, '次');
-      console.log('Response:', sanitizeLog(errData));
-      console.groupEnd();
       throw new Error(debug.error);
     }
     break;
@@ -1030,9 +964,9 @@ function SettingsPanel({ aspect, setAspect, count, setCount, model, setModel, re
 
 // ---------- API 网络线路 ----------
 const ROUTES = [
-  { id: 'global', label: '全球加速', desc: '默认线路，全球访问优化' },
-  { id: 'cf', label: 'CF 加速', desc: 'Cloudflare 加速节点' },
-  { id: 'us', label: '美国直连', desc: '美国服务器直连' },
+  { id: 'global', label: '全球加速', desc: '全球访问优化' },
+  { id: 'cf', label: 'CF 加速', desc: 'Cloudflare 全球访问优化' },
+  { id: 'us', label: '美国直连', desc: '美国直连，900s 超时抗压' },
 ];
 
 function ApiSettingsModal({ open, onClose, currentRoute, hasSavedKey, selectedRoute, onRouteChange, inputApiKey, onApiKeyChange, testStatus, testMessage, onTest, onConfirm, onClear, saving, showApiKey, onToggleShowKey }) {
@@ -1075,7 +1009,7 @@ function ApiSettingsModal({ open, onClose, currentRoute, hasSavedKey, selectedRo
             <div className="modal-section-label">
               API 密钥
               <span className="modal-section-hint">
-                {keyConfigured ? '已配置 · 输入可替换' : '未配置 · 保存后可启用'}
+                {keyConfigured ? '已配置 · 切换线路无需重输' : '未配置 · 保存后可启用'}
               </span>
             </div>
             <div className="api-key-input-wrap">
@@ -1109,7 +1043,7 @@ function ApiSettingsModal({ open, onClose, currentRoute, hasSavedKey, selectedRo
             <button
               className="api-btn api-btn-test"
               onClick={onTest}
-              disabled={!inputApiKey.trim() || testStatus === 'testing'}>
+              disabled={(!inputApiKey.trim() && !hasSavedKey) || testStatus === 'testing'}>
               {testStatus === 'testing' ? '测试中...' : '测试连接'}
             </button>
             <button
@@ -1252,6 +1186,7 @@ function App() {
   const [savedApiKey, setSavedApiKey] = useState('');
   const [selectedRoute, setSelectedRoute] = useState('global');
   const [inputApiKey, setInputApiKey] = useState('');
+  const [isKeyModified, setIsKeyModified] = useState(false); // 用户是否手动修改了 key
   const [showApiKey, setShowApiKey] = useState(false);
   const [testStatus, setTestStatus] = useState(null); // null | 'testing' | 'success' | 'error'
   const [testMessage, setTestMessage] = useState('');
@@ -1298,7 +1233,7 @@ function App() {
         setSelectedRoute(cfg.route || 'global');
         const configured = cfg.configured || false;
         setHasSavedKey(configured);
-        setSavedApiKey(configured ? (cfg.apiKey || '') : '');
+        setSavedApiKey(cfg.apiKey || '');
         setKeyPreview(cfg.keyPreview || '');
       })
       .catch(() => {});
@@ -1310,7 +1245,9 @@ function App() {
   const openApiSettings = useCallback(() => {
     // 先用当前已知值立即打开，避免白屏等待
     setSelectedRoute(currentRoute);
-    setInputApiKey(savedApiKey);
+    // 已配置时显示完整 key，标记 key 未修改
+    setInputApiKey(hasSavedKey && savedApiKey ? savedApiKey : '');
+    setIsKeyModified(false);
     setShowApiKey(false);
     setTestStatus(null);
     setTestMessage('');
@@ -1323,21 +1260,26 @@ function App() {
         setSelectedRoute(cfg.route || 'global');
         const configured = cfg.configured || false;
         setHasSavedKey(configured);
-        const key = configured ? (cfg.apiKey || '') : '';
-        setSavedApiKey(key);
-        setInputApiKey(key);
+        const fullKey = cfg.apiKey || '';
+        setSavedApiKey(fullKey);
         setKeyPreview(cfg.keyPreview || '');
+        // 刷新后若 key 未手动修改，回填完整 key
+        if (!isKeyModified) {
+          setInputApiKey(fullKey);
+        }
       })
       .catch(() => {});
-  }, [currentRoute, savedApiKey]);
+  }, [currentRoute, hasSavedKey, savedApiKey, isKeyModified]);
   const testApiConnection = useCallback(async () => {
     setTestStatus('testing');
     setTestMessage('');
+    // key 未手动修改时传空，服务端会使用已保存的 key
+    const keyToSend = isKeyModified ? inputApiKey : '';
     try {
       const res = await fetch('/api/config/test', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ route: selectedRoute, apiKey: inputApiKey }),
+        body: JSON.stringify({ route: selectedRoute, apiKey: keyToSend }),
       });
       const data = await res.json();
       if (data.ok) {
@@ -1351,24 +1293,28 @@ function App() {
       setTestStatus('error');
       setTestMessage(`网络错误: ${e.message}`);
     }
-  }, [selectedRoute, inputApiKey]);
+  }, [selectedRoute, inputApiKey, isKeyModified]);
 
   // 确认保存配置
   const confirmSaveConfig = useCallback(async () => {
     if (testStatus !== 'success') return;
     setSavingConfig(true);
+    // key 未手动修改时传空，服务端会保留已保存的 key
+    const keyToSend = isKeyModified ? inputApiKey : '';
     try {
       const res = await fetch('/api/config/save', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ route: selectedRoute, apiKey: inputApiKey }),
+        body: JSON.stringify({ route: selectedRoute, apiKey: keyToSend }),
       });
       const data = await res.json();
       if (data.ok) {
         setCurrentRoute(selectedRoute);
         setHasSavedKey(true);
-        setSavedApiKey(inputApiKey);
-        setKeyPreview(inputApiKey.slice(0,5) + '****' + inputApiKey.slice(-4));
+        if (isKeyModified && inputApiKey) {
+          setSavedApiKey(inputApiKey);
+          setKeyPreview(inputApiKey.slice(0,5) + '****' + inputApiKey.slice(-4));
+        }
         setApiSettingsOpen(false);
         showToast('API 配置已保存');
       } else {
@@ -1379,7 +1325,7 @@ function App() {
     } finally {
       setSavingConfig(false);
     }
-  }, [testStatus, selectedRoute, inputApiKey, showToast]);
+  }, [testStatus, selectedRoute, inputApiKey, isKeyModified, showToast]);
 
   // 清除 API 配置
   const clearApiConfig = useCallback(async () => {
@@ -1391,6 +1337,7 @@ function App() {
         setSavedApiKey('');
         setKeyPreview('');
         setInputApiKey('');
+        setIsKeyModified(false);
         setTestStatus(null);
         setTestMessage('');
         showToast('API Key 已清除');
@@ -1405,6 +1352,7 @@ function App() {
   // 输入变更时重置测试状态
   const handleApiKeyChange = useCallback((val) => {
     setInputApiKey(val);
+    setIsKeyModified(true);
     if (testStatus === 'success') {
       setTestStatus(null);
       setTestMessage('');
