@@ -3,6 +3,30 @@
 """o1key 图片生成器 — 本地开发服务器
    服务静态文件 + 代理请求到 o1key 异步 API + 持久化生成历史
    用法: python server.py [port]   (默认 8080)
+
+   ═══════════════════════════════════════════════════════════════════════════════
+   DEVELOPER RULE: SSE stream teardown — always drain before breaking
+   ═══════════════════════════════════════════════════════════════════════════════
+   当读取 OpenAI/SSE 流式响应时，遇到 data: [DONE] 后必须排空剩余 HTTP
+   chunked-encoding 数据再 break，否则会导致严重 Bug：
+
+   ❌ 错误模式:
+       if line == "[DONE]": break          # 直接跳过，遗留脏字节
+
+   ✅ 正确模式:
+       if line == "[DONE]":
+           resp.raw.drain_conn()           # 排空 HTTP chunk terminator
+           break
+
+   不排空会导致:
+   1. 本地代理(如 Clash/V2Ray)连接的接收缓冲区残留未读字节
+   2. 下一次请求复用该代理连接时返回 "Response ended prematurely" (500)
+   3. 前端陷入重试死循环——但上游实际上已经成功生成图片
+
+   影响范围: 该 Bug 导致 nano-banana-pro 第二次请求卡死/500，
+   排查耗时 2 小时(本地直连 API 正常, 仅代理环境复现)。
+   初次修复提交: 2026-05-18。请勿还原为 break 模式。
+   ═══════════════════════════════════════════════════════════════════════════════
 """
 
 import sys
@@ -27,10 +51,15 @@ import requests
 from urllib.parse import urlparse, parse_qs
 
 APP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app")
+ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 HISTORY_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 THUMBS_DIR = os.path.join(HISTORY_DIR, "thumbs")
+CHATS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chats")
 PORT = 8080
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
+
+# 会话 ID 校验：字母数字 + _ -，长度 1~64，防止路径穿越
+CHAT_ID_RE = re.compile(r'^[a-zA-Z0-9_-]{1,64}$')
 
 # ---------- 路由 → 域名映射 ----------
 ROUTE_DOMAINS = {
@@ -378,12 +407,17 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
             self._handle_cancel()
         elif self.path == "/api/images":
             self._save_images()
+        elif self.path == "/api/chat":
+            self._handle_chat()
         elif self.path == "/api/config/test":
             self._handle_config_test()
         elif self.path == "/api/config/save":
             self._handle_config_save()
         elif self.path == "/api/config/clear":
             self._handle_config_clear()
+        elif self.path.startswith("/api/chats/"):
+            chat_id = self.path[len("/api/chats/"):]
+            self._handle_chat_save(chat_id)
         else:
             self._json({"error": "not found"}, 404)
 
@@ -572,17 +606,19 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
         if tc:
             print(f"[GENERATE-SYNC] thinkingConfig: {json.dumps(tc, ensure_ascii=False)}")
 
-        # 发送请求 (不用 stream=True，避免中间代理 idle timeout 切断连接)
+        # 发送请求 (stream=True 逐块读取，避免上游 SSE 不关闭连接导致挂死)
         headers = {
             "Authorization": f"Bearer {O1KEY_API_KEY}",
             "Content-Type": "application/json",
         }
 
+        STREAM_IDLE_TIMEOUT = 300  # 单块读取超时 (秒)
+
         resp = None
         for attempt in range(RETRY_MAX + 1):
             try:
                 resp = requests.post(sync_url, headers=headers, json=req_body,
-                                    timeout=GEN_TIMEOUT)
+                                    stream=True, timeout=(30, STREAM_IDLE_TIMEOUT))
             except requests.exceptions.RequestException as e:
                 print(f"[ERROR] 请求失败: {e}")
                 self._json({"error": {"message": f"API 请求失败: {e}"}}, 500)
@@ -599,41 +635,68 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
         if resp.status_code != 200:
             err_text = resp.text[:500]
             print(f"[ERROR] 请求失败 [{resp.status_code}]: {err_text}")
-            if resp.status_code == 503:
+            if resp.status_code in (401, 403):
+                self._json({"error": {"message": "令牌不可用，请检查余额或令牌是否正确"}}, resp.status_code)
+            elif resp.status_code == 503:
                 self._json({"error": {"message": "模型暂不可用，请稍后重试或检查分组"}}, resp.status_code)
             else:
                 self._json({"error": {"message": f"API 错误 [{resp.status_code}]: {err_text}"}}, resp.status_code)
             return
 
-        # 解析 OpenAI 流式 SSE 响应
+        # 解析 OpenAI 流式 SSE 响应 (逐行读取，遇到 [DONE] 排空剩余 HTTP chunk 后结束)
         # 格式: choices[].delta.content 拼接得到 "![image](data:image/...;base64,...)"
+        # 注意: 必须在 [DONE] 后调用 drain_conn() 排空剩余字节，
+        #       避免经过本地代理时连接处于脏状态，导致第二次请求返回 "Response ended prematurely"
         accumulated_content = ""
         line_count = 0
-        for line in resp.text.splitlines():
-            if not line:
-                continue
+        done_seen = False
+        try:
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
 
-            if line.startswith("data:"):
-                line = line[5:].lstrip()
+                if line.startswith("data:"):
+                    line = line[5:].lstrip()
 
-            if not line or line == "[DONE]":
-                continue
+                if not line:
+                    continue
+                if line == "[DONE]":
+                    done_seen = True
+                    print(f"[GENERATE-SYNC] 收到 [DONE]，已读 {line_count} 行，排空剩余 HTTP chunk...")
+                    try:
+                        resp.raw.drain_conn()
+                    except Exception as drain_err:
+                        print(f"[GENERATE-SYNC] drain_conn 异常（可忽略）: {drain_err}")
+                    break
 
-            try:
-                chunk = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+                try:
+                    chunk = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
 
-            line_count += 1
+                line_count += 1
 
-            choices = chunk.get("choices", [])
-            for choice in choices:
-                delta = choice.get("delta", {})
-                content = delta.get("content", "")
-                if content:
-                    accumulated_content += content
+                choices = chunk.get("choices", [])
+                for choice in choices:
+                    delta = choice.get("delta", {})
+                    content = delta.get("content", "")
+                    if content:
+                        accumulated_content += content
+        except requests.exceptions.ReadTimeout:
+            print(f"[GENERATE-SYNC] 流读取超时 ({STREAM_IDLE_TIMEOUT}s 无新数据, done={done_seen})")
+            if not accumulated_content:
+                self._json({"error": {"message": f"上游响应超时 ({STREAM_IDLE_TIMEOUT}s 无数据)"}}, 504)
+                return
+        except (requests.exceptions.ChunkedEncodingError,
+                requests.exceptions.ConnectionError) as e:
+            print(f"[GENERATE-SYNC] 流读取连接异常 (done={done_seen}): {type(e).__name__}: {e}")
+            if not accumulated_content:
+                self._json({"error": {"message": f"上游连接中断: {e}"}}, 502)
+                return
+        finally:
+            resp.close()
 
-        print(f"[GENERATE-SYNC] 流完成: {line_count} 行, content={len(accumulated_content)} chars")
+        print(f"[GENERATE-SYNC] 流完成: {line_count} 行, done_seen={done_seen}, content={len(accumulated_content)} chars")
 
         # 从 Markdown 图片语法中提取 data URL: ![image](data:image/jpeg;base64,...)
         idx = accumulated_content.find("data:image/")
@@ -738,7 +801,7 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
         for attempt in range(RETRY_MAX + 1):
             try:
                 resp = requests.post(gpt_url, headers=hdrs, json=req_body,
-                                    stream=True, timeout=GEN_TIMEOUT)
+                                    stream=True, timeout=(30, 300))
             except requests.exceptions.RequestException as e:
                 print(f"[GPT-IMAGE] 请求失败: {e}")
                 self._json({"error": {"message": f"API 请求失败: {e}"}}, 500)
@@ -750,6 +813,9 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
                 if resp.status_code == 429:
                     should_retry = True
                     retry_reason = "429"
+                elif resp.status_code in (502, 503, 504):
+                    should_retry = True
+                    retry_reason = str(resp.status_code)
                 elif resp.status_code == 400:
                     try:
                         err_text = resp.text
@@ -771,27 +837,56 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
             err_text = resp.text[:500] if resp.text else ""
             print(f"[GPT-IMAGE] 请求失败 [{resp.status_code}]: {err_text}")
             resp.close()
-            err_msg = f"API 错误 [{resp.status_code}]: {err_text}"
-            try:
-                upstream = json.loads(err_text)
-                original = upstream.get("error", {}).get("message", "")
-                if original:
-                    err_msg = original
-            except Exception:
-                pass
+            if resp.status_code in (401, 403):
+                err_msg = "令牌不可用，请检查余额或令牌是否正确"
+            elif resp.status_code == 503:
+                err_msg = "模型暂不可用，请稍后重试或检查分组"
+            else:
+                err_msg = f"API 错误 [{resp.status_code}]: {err_text}"
+                try:
+                    upstream = json.loads(err_text)
+                    original = upstream.get("error", {}).get("message", "")
+                    if original:
+                        err_msg = original
+                except Exception:
+                    pass
             self._json({"error": {"message": err_msg}}, resp.status_code)
             return
 
-        # 返回 JSON 响应（不使用 SSE 代理）
-        body_text = resp.content.decode('utf-8')
-        resp.close()
-        print(f"[GPT-IMAGE] 响应长度: {len(body_text)} bytes")
-
+        # 流式读取 SSE 响应，拼接完整 JSON
+        chunks = []
         try:
-            data = json.loads(body_text)
-        except json.JSONDecodeError:
-            self._json({"error": {"message": f"上游返回非 JSON: {body_text[:200]}"}}, 500)
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                if line.startswith("data:"):
+                    line = line[5:].lstrip()
+                if not line or line == "[DONE]":
+                    continue
+                chunks.append(line)
+        except requests.exceptions.ReadTimeout:
+            print(f"[GPT-IMAGE] 流读取超时 (300s 无新数据)")
+            if not chunks:
+                self._json({"error": {"message": "上游响应超时 (300s 无数据)"}}, 504)
+                return
+        finally:
+            resp.close()
+
+        # 取最后一个有效 JSON chunk 作为最终结果
+        data = None
+        for raw in reversed(chunks):
+            try:
+                data = json.loads(raw)
+                break
+            except json.JSONDecodeError:
+                continue
+
+        if not data:
+            body_text = "\n".join(chunks)[:200]
+            self._json({"error": {"message": f"上游返回非 JSON: {body_text}"}}, 500)
             return
+
+        print(f"[GPT-IMAGE] SSE 流完成: {len(chunks)} chunks")
 
         # 提取图片 URL
         img_url = ""
@@ -874,6 +969,9 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
                 if resp.status_code == 429:
                     should_retry = True
                     retry_reason = "429"
+                elif resp.status_code in (502, 503, 504):
+                    should_retry = True
+                    retry_reason = str(resp.status_code)
                 elif resp.status_code == 400:
                     try:
                         if "high load" in resp.text.lower():
@@ -894,14 +992,19 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
             err_text = resp.text[:500] if resp.text else ""
             print(f"[GPT-IMAGE-EDIT] 请求失败 [{resp.status_code}]: {err_text}")
             resp.close()
-            err_msg = f"API 错误 [{resp.status_code}]: {err_text}"
-            try:
-                upstream = json.loads(err_text)
-                original = upstream.get("error", {}).get("message", "")
-                if original:
-                    err_msg = original
-            except Exception:
-                pass
+            if resp.status_code in (401, 403):
+                err_msg = "令牌不可用，请检查余额或令牌是否正确"
+            elif resp.status_code == 503:
+                err_msg = "模型暂不可用，请稍后重试或检查分组"
+            else:
+                err_msg = f"API 错误 [{resp.status_code}]: {err_text}"
+                try:
+                    upstream = json.loads(err_text)
+                    original = upstream.get("error", {}).get("message", "")
+                    if original:
+                        err_msg = original
+                except Exception:
+                    pass
             self._json({"error": {"message": err_msg}}, resp.status_code)
             return
 
@@ -1136,7 +1239,7 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
             "base_url": O1KEY_BASE,
             "hasKey": bool(O1KEY_API_KEY),
             "configured": _CONFIGURED,
-            "keyPreview": ("***" + O1KEY_API_KEY[-8:]) if O1KEY_API_KEY else "",
+            "keyPreview": (O1KEY_API_KEY[:5] + "****" + O1KEY_API_KEY[-4:]) if O1KEY_API_KEY else "",
         })
 
     def _handle_config_test(self):
@@ -1226,6 +1329,13 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
             self._list_images()
         elif parsed.path.startswith("/api/images/"):
             self._serve_image(parsed.path, parse_qs(parsed.query))
+        elif parsed.path == "/api/chats":
+            self._handle_chats_list()
+        elif parsed.path.startswith("/api/chats/"):
+            chat_id = parsed.path[len("/api/chats/"):]
+            self._handle_chat_get(chat_id)
+        elif parsed.path.startswith("/assets/"):
+            self._serve_asset(parsed.path)
         elif self._is_sensitive_path(parsed.path):
             self._json({"error": "not found"}, 404)
         else:
@@ -1235,8 +1345,38 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path.startswith("/api/images/"):
             self._delete_image(parsed.path)
+        elif parsed.path.startswith("/api/chats/"):
+            chat_id = parsed.path[len("/api/chats/"):]
+            self._handle_chat_delete(chat_id)
         else:
             self._json({"error": "not found"}, 404)
+
+    def _serve_asset(self, url_path):
+        """Serve static files from ASSETS_DIR (e.g. /assets/claude-color.svg)"""
+        fname = url_path[len("/assets/"):]
+        if not fname or '..' in fname or '/' in fname or '\\' in fname:
+            self._json({"error": "not found"}, 404)
+            return
+        full = os.path.join(ASSETS_DIR, fname)
+        if not os.path.isfile(full):
+            self._json({"error": "not found"}, 404)
+            return
+        ext = os.path.splitext(fname)[1].lower()
+        mime_map = {'.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg',
+                    '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif'}
+        mime = mime_map.get(ext, 'application/octet-stream')
+        try:
+            with open(full, "rb") as f:
+                data = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception:
+            self._json({"error": "read failed"}, 500)
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -1513,11 +1653,273 @@ class BananaHandler(http.server.SimpleHTTPRequestHandler):
         self._json({"ok": True})
 
     def _json(self, data, status=200):
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
-        self.wfile.write(json.dumps(data, ensure_ascii=False).encode("utf-8"))
+        self.wfile.write(body)
+
+    # ================================================================
+    # 对话流代理 (/v1/chat/completions) — 完全独立于图片生成
+    # 透明 SSE 中继：前端拿到原始 OpenAI delta，自行累加 content / tool_calls
+    # 设计意图：后期接入 agent (function calling) 时不需要改后端
+    # ================================================================
+    def _handle_chat(self):
+        try:
+            self._handle_chat_inner()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            try:
+                self._json({"error": {"message": f"对话服务异常: {e}"}}, 500)
+            except Exception:
+                pass
+
+    def _handle_chat_inner(self):
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(content_length))
+        except Exception:
+            self._json({"error": {"message": "请求体解析失败"}}, 400)
+            return
+
+        model = body.get("model")
+        messages = body.get("messages")
+        if not model or not messages:
+            self._json({"error": {"message": "缺少 model 或 messages"}}, 400)
+            return
+
+        req_body = {
+            "model": model,
+            "messages": messages,
+            "stream": True,
+        }
+        # 透传可选参数（temperature/max_tokens/tools 等，agent 时段直接生效）
+        for k in ("temperature", "max_tokens", "top_p", "tools",
+                  "tool_choice", "response_format", "stop", "presence_penalty",
+                  "frequency_penalty", "seed"):
+            if k in body:
+                req_body[k] = body[k]
+
+        chat_url = f"{O1KEY_BASE}/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {O1KEY_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        print(f"\n[CHAT] POST {chat_url} model={model} messages={len(messages)}")
+
+        STREAM_IDLE_TIMEOUT = 300
+        try:
+            resp = requests.post(chat_url, headers=headers, json=req_body,
+                                 stream=True, timeout=(30, STREAM_IDLE_TIMEOUT))
+        except requests.exceptions.RequestException as e:
+            print(f"[CHAT] 请求失败: {e}")
+            self._json({"error": {"message": f"API 请求失败: {e}"}}, 500)
+            return
+
+        if resp.status_code != 200:
+            err_text = resp.text[:500]
+            print(f"[CHAT] 上游错误 [{resp.status_code}]: {err_text}")
+            try:
+                self._json({"error": {"message": f"上游错误 [{resp.status_code}]: {err_text}"}}, resp.status_code)
+            except Exception:
+                pass
+            return
+
+        # 进入 SSE 中继模式
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache, no-transform")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            resp.close()
+            return
+
+        done_seen = False
+        relayed_lines = 0
+        client_alive = True
+        try:
+            for raw in resp.iter_lines(decode_unicode=False):
+                if raw is None:
+                    continue
+                if not raw:
+                    # 上游事件分隔空行（通常 iter_lines 已剥离，但保险起见忽略）
+                    continue
+
+                if raw.startswith(b"data:"):
+                    payload = raw[5:].lstrip()
+                    if payload == b"[DONE]":
+                        done_seen = True
+                        if client_alive:
+                            try:
+                                self.wfile.write(b"data: [DONE]\n\n")
+                                self.wfile.flush()
+                            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                                client_alive = False
+                        # 关键：必须排空剩余 chunk 后再 break，避免下次请求 500
+                        try:
+                            resp.raw.drain_conn()
+                        except Exception as drain_err:
+                            print(f"[CHAT] drain_conn 异常（可忽略）: {drain_err}")
+                        break
+
+                if client_alive:
+                    try:
+                        self.wfile.write(raw)
+                        self.wfile.write(b"\n\n")
+                        self.wfile.flush()
+                        relayed_lines += 1
+                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                        print(f"[CHAT] 客户端断开，但继续排空上游连接")
+                        client_alive = False
+        except requests.exceptions.ReadTimeout:
+            print(f"[CHAT] 流读取超时 ({STREAM_IDLE_TIMEOUT}s 无新数据, done={done_seen})")
+        except (requests.exceptions.ChunkedEncodingError,
+                requests.exceptions.ConnectionError) as e:
+            print(f"[CHAT] 流读取连接异常 (done={done_seen}): {type(e).__name__}: {e}")
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+        print(f"[CHAT] 完成: relayed={relayed_lines} 行, done={done_seen}, client_alive={client_alive}")
+
+    # ================================================================
+    # 会话存储 (chats/{id}.json) — 文件即真相，前端只持 UI 偏好
+    # 设计：原子写入(临时文件 + rename) 保证不出现半文件
+    # ================================================================
+    def _chat_path(self, chat_id):
+        """校验 id 并返回会话文件路径；不合法返回 None"""
+        if not CHAT_ID_RE.match(chat_id or ""):
+            return None
+        os.makedirs(CHATS_DIR, exist_ok=True)
+        return os.path.join(CHATS_DIR, f"{chat_id}.json")
+
+    def _handle_chats_list(self):
+        """GET /api/chats — 返回会话元数据列表，按 updated_at 倒序"""
+        os.makedirs(CHATS_DIR, exist_ok=True)
+        items = []
+        try:
+            fnames = os.listdir(CHATS_DIR)
+        except FileNotFoundError:
+            fnames = []
+        for fname in fnames:
+            if not fname.endswith(".json"):
+                continue
+            full = os.path.join(CHATS_DIR, fname)
+            try:
+                with open(full, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                items.append({
+                    "id": data.get("id") or fname[:-5],
+                    "title": data.get("title") or "新对话",
+                    "provider": data.get("provider"),
+                    "model": data.get("model"),
+                    "created_at": data.get("created_at"),
+                    "updated_at": data.get("updated_at"),
+                    "message_count": len(data.get("messages") or []),
+                })
+            except Exception as e:
+                print(f"[CHATS] 读取 {fname} 失败: {e}")
+        items.sort(key=lambda x: x.get("updated_at") or 0, reverse=True)
+        self._json({"items": items})
+
+    def _handle_chat_get(self, chat_id):
+        """GET /api/chats/{id} — 返回完整会话"""
+        path = self._chat_path(chat_id)
+        if not path:
+            self._json({"error": "invalid id"}, 400)
+            return
+        if not os.path.exists(path):
+            self._json({"error": "not found"}, 404)
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._json(data)
+        except Exception as e:
+            print(f"[CHATS] GET {chat_id} 失败: {e}")
+            self._json({"error": f"读取失败: {e}"}, 500)
+
+    def _handle_chat_save(self, chat_id):
+        """POST /api/chats/{id} — upsert 会话；原子写入"""
+        path = self._chat_path(chat_id)
+        if not path:
+            self._json({"error": "invalid id"}, 400)
+            return
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(content_length))
+        except Exception:
+            self._json({"error": "请求体解析失败"}, 400)
+            return
+
+        now = int(time.time())
+        # 读旧值（如果存在）保留 created_at
+        created_at = now
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    old = json.load(f)
+                created_at = old.get("created_at") or now
+            except Exception:
+                pass
+
+        data = {
+            "id": chat_id,
+            "title": (body.get("title") or "新对话")[:80],
+            "provider": body.get("provider"),
+            "model": body.get("model"),
+            "messages": body.get("messages") or [],
+            "created_at": created_at,
+            "updated_at": now,
+        }
+        # 可选元数据透传（system prompt、tools 等 agent 时段使用）
+        for k in ("system", "tools", "tool_choice"):
+            if k in body:
+                data[k] = body[k]
+
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        except Exception as e:
+            print(f"[CHATS] 写入 {chat_id} 失败: {e}")
+            self._json({"error": f"保存失败: {e}"}, 500)
+            return
+
+        self._json({
+            "id": chat_id,
+            "title": data["title"],
+            "provider": data["provider"],
+            "model": data["model"],
+            "created_at": created_at,
+            "updated_at": now,
+            "message_count": len(data["messages"]),
+        })
+
+    def _handle_chat_delete(self, chat_id):
+        """DELETE /api/chats/{id}"""
+        path = self._chat_path(chat_id)
+        if not path:
+            self._json({"error": "invalid id"}, 400)
+            return
+        if not os.path.exists(path):
+            self._json({"ok": True, "missing": True})
+            return
+        try:
+            os.remove(path)
+            self._json({"ok": True})
+        except Exception as e:
+            print(f"[CHATS] 删除 {chat_id} 失败: {e}")
+            self._json({"error": f"删除失败: {e}"}, 500)
 
 
 if __name__ == "__main__":

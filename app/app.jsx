@@ -150,6 +150,7 @@ async function callGeminiImageGeneration(prompt, refImages, aspectRatio, modelId
 
   // --- 请求（带指数退让重试） ---
   const MAX_RETRIES = 3;
+  const FETCH_TIMEOUT = 300000; // 前端兜底超时 300s
   const startTime = performance.now();
   let response;
   let attempt = 0;
@@ -161,17 +162,26 @@ async function callGeminiImageGeneration(prompt, refImages, aspectRatio, modelId
       await new Promise(r => setTimeout(r, waitMs));
     }
     try {
+      const timeoutSignal = AbortSignal.timeout(FETCH_TIMEOUT);
+      const combinedSignal = signal
+        ? AbortSignal.any([signal, timeoutSignal])
+        : timeoutSignal;
       response = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Request-ID': requestId || '' },
         body: JSON.stringify(requestBody),
-        signal: signal || null,
+        signal: combinedSignal,
       });
     } catch (fetchErr) {
       if (fetchErr.name === 'AbortError') {
         debug.error = '已取消';
         console.log('%c⏹️ 请求已取消 (AbortError)', 'color:#F59E0B');
         throw fetchErr;
+      }
+      if (fetchErr.name === 'TimeoutError') {
+        debug.error = `请求超时 (${FETCH_TIMEOUT / 1000}s)`;
+        console.error('%c❌ 请求超时', 'color:#EF4444;font-weight:bold');
+        throw new Error(debug.error);
       }
       if (attempt >= MAX_RETRIES) {
         debug.error = `网络错误 (已重试${MAX_RETRIES}次): ${fetchErr.message}`;
@@ -297,6 +307,7 @@ async function callGptImageGeneration(prompt, modelId, n, size, quality, outputF
   console.groupEnd();
 
   const MAX_RETRIES = 3;
+  const FETCH_TIMEOUT = 300000;
   const startTime = performance.now();
   let response;
   let attempt = 0;
@@ -308,17 +319,26 @@ async function callGptImageGeneration(prompt, modelId, n, size, quality, outputF
       await new Promise(r => setTimeout(r, waitMs));
     }
     try {
+      const timeoutSignal = AbortSignal.timeout(FETCH_TIMEOUT);
+      const combinedSignal = signal
+        ? AbortSignal.any([signal, timeoutSignal])
+        : timeoutSignal;
       response = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Request-ID': requestId || '' },
         body: JSON.stringify(requestBody),
-        signal: signal || null,
+        signal: combinedSignal,
       });
     } catch (fetchErr) {
       if (fetchErr.name === 'AbortError') {
         debug.error = '已取消';
         console.log('%c⏹️ 请求已取消 (AbortError)', 'color:#F59E0B');
         throw fetchErr;
+      }
+      if (fetchErr.name === 'TimeoutError') {
+        debug.error = `请求超时 (${FETCH_TIMEOUT / 1000}s)`;
+        console.error('%c❌ 请求超时', 'color:#EF4444;font-weight:bold');
+        throw new Error(debug.error);
       }
       if (attempt >= MAX_RETRIES) {
         debug.error = `网络错误 (已重试${MAX_RETRIES}次): ${fetchErr.message}`;
@@ -473,6 +493,7 @@ async function callGptImageEdit(prompt, modelId, n, size, quality, outputFormat,
   console.groupEnd();
 
   const MAX_RETRIES = 3;
+  const FETCH_TIMEOUT = 300000;
   let response;
   let attempt = 0;
 
@@ -483,17 +504,26 @@ async function callGptImageEdit(prompt, modelId, n, size, quality, outputFormat,
       await new Promise(r => setTimeout(r, waitMs));
     }
     try {
+      const timeoutSignal = AbortSignal.timeout(FETCH_TIMEOUT);
+      const combinedSignal = signal
+        ? AbortSignal.any([signal, timeoutSignal])
+        : timeoutSignal;
       response = await fetch(url, {
         method: 'POST',
         headers: { 'X-Request-ID': requestId || '' },
         body: fd,
-        signal: signal || null,
+        signal: combinedSignal,
       });
     } catch (fetchErr) {
       if (fetchErr.name === 'AbortError') {
         debug.error = '已取消';
         console.log('%c⏹️ 请求已取消 (AbortError)', 'color:#F59E0B');
         throw fetchErr;
+      }
+      if (fetchErr.name === 'TimeoutError') {
+        debug.error = `请求超时 (${FETCH_TIMEOUT / 1000}s)`;
+        console.error('%c❌ 请求超时', 'color:#EF4444;font-weight:bold');
+        throw new Error(debug.error);
       }
       if (attempt >= MAX_RETRIES) {
         debug.error = `网络错误 (已重试${MAX_RETRIES}次): ${fetchErr.message}`;
@@ -1122,8 +1152,15 @@ function Toast({ msg }) {
 
 // ---------- 主应用 ----------
 function App() {
-  const [prompt, setPrompt] = useState('');
-  const [images, setImages] = useState([]); // {id, url}
+  const [prompt, setPrompt] = useState(() => {
+    try { return localStorage.getItem('draft_prompt') || ''; } catch { return ''; }
+  });
+  const [images, setImages] = useState(() => {
+    try {
+      const saved = localStorage.getItem('draft_images');
+      return saved ? JSON.parse(saved) : [];
+    } catch { return []; }
+  }); // {id, url}
   const [aspect, setAspect] = useState('1:1');
   const [count, setCount] = useState(1);
   const [model, setModel] = useState('pro');
@@ -1139,6 +1176,18 @@ function App() {
   const [gptCustomHStr, setGptCustomHStr] = useState('1024');
   const [gptMask, setGptMask] = useState(null);       // 编辑蒙版 File（编辑模式 + 非编辑模式通用）
   const [gptMaskUrl, setGptMaskUrl] = useState(null);  // 蒙版预览 data URL
+
+  // 草稿持久化：prompt 实时写，images 防抖 300ms
+  useEffect(() => {
+    try { localStorage.setItem('draft_prompt', prompt); } catch {}
+  }, [prompt]);
+
+  useEffect(() => {
+    const t = setTimeout(() => {
+      try { localStorage.setItem('draft_images', JSON.stringify(images)); } catch {}
+    }, 300);
+    return () => clearTimeout(t);
+  }, [images]);
 
   // 离开 GPT 模型或清空参考图时，清除蒙版
   useEffect(() => {
@@ -1207,6 +1256,7 @@ function App() {
   const [testStatus, setTestStatus] = useState(null); // null | 'testing' | 'success' | 'error'
   const [testMessage, setTestMessage] = useState('');
   const [savingConfig, setSavingConfig] = useState(false);
+  const [keyPreview, setKeyPreview] = useState('');
 
   // 点击外部关闭参数面板
   useEffect(() => {
@@ -1249,6 +1299,7 @@ function App() {
         const configured = cfg.configured || false;
         setHasSavedKey(configured);
         setSavedApiKey(configured ? (cfg.apiKey || '') : '');
+        setKeyPreview(cfg.keyPreview || '');
       })
       .catch(() => {});
   }, []);
@@ -1275,6 +1326,7 @@ function App() {
         const key = configured ? (cfg.apiKey || '') : '';
         setSavedApiKey(key);
         setInputApiKey(key);
+        setKeyPreview(cfg.keyPreview || '');
       })
       .catch(() => {});
   }, [currentRoute, savedApiKey]);
@@ -1316,6 +1368,7 @@ function App() {
         setCurrentRoute(selectedRoute);
         setHasSavedKey(true);
         setSavedApiKey(inputApiKey);
+        setKeyPreview(inputApiKey.slice(0,5) + '****' + inputApiKey.slice(-4));
         setApiSettingsOpen(false);
         showToast('API 配置已保存');
       } else {
@@ -1336,6 +1389,7 @@ function App() {
       if (data.ok) {
         setHasSavedKey(false);
         setSavedApiKey('');
+        setKeyPreview('');
         setInputApiKey('');
         setTestStatus(null);
         setTestMessage('');
@@ -2108,11 +2162,6 @@ function App() {
           </div>
           <span className="brand-name">o1key</span>
         </div>
-        <div className="header-actions">
-          <button className="icon-btn" onClick={openApiSettings} title="API 设置">
-            <Icon name="gear" size={20} />
-          </button>
-        </div>
       </header>
 
       <main className="main">
@@ -2598,7 +2647,7 @@ function App() {
         {generations.length > 0 && (() => {
           const renderTile = ({ gen, tile }) => (
             <div key={tile.id}
-              className={`gen-tile ${tile.status === 'loading' ? 'skeleton' : ''}`}
+              className={`gen-tile ${tile.status === 'loading' ? 'skeleton' : ''} ${tile.status === 'done' ? 'tile-enter' : ''}`}
               style={{ aspectRatio: gen.aspect ? gen.aspect.replace(':', ' / ') : '1 / 1' }}>
               {tile.status === 'loading' && (() => {
                 const elapsed = gen.time ? Math.floor((Date.now() - new Date(gen.time).getTime()) / 1000) : 0;
@@ -2863,6 +2912,21 @@ function App() {
 
       <Toast msg={toast} />
 
+      {/* 左下角令牌指示器 */}
+      <div className={`token-indicator ${hasSavedKey ? 'has-key' : ''}`} onClick={openApiSettings} title={hasSavedKey ? '已配置令牌' : '点击添加令牌'}>
+        {hasSavedKey ? (
+          <React.Fragment>
+            <span className="token-dot" />
+            <span className="token-key">{keyPreview}</span>
+          </React.Fragment>
+        ) : (
+          <React.Fragment>
+            <svg className="token-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
+            <span className="token-label">添加令牌</span>
+          </React.Fragment>
+        )}
+      </div>
+
       {/* API 设置弹窗 */}
       <ApiSettingsModal
         open={apiSettingsOpen}
@@ -2954,4 +3018,612 @@ function App() {
   );
 }
 
-ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+// ================================================================
+// ChatPanel — 对话流（独立于 <App/>，完全不共享状态）
+// 设计目标：
+//   1. /v1/chat/completions 透传，多模型通用（Claude/Gemini/GPT 走 o1key 网关）
+//   2. 消息结构遵循 OpenAI 规范，预留 tool_calls / tool_call_id，
+//      后期开 agent（function calling）时无需改 schema 与解析器
+//   3. localStorage key 用 chat_v1_ 前缀，方便后续 schema 迁移
+//   4. AbortController 控制流，停止时不污染后端连接（drain_conn 在 server 侧已处理）
+// ================================================================
+
+const CHAT_MODELS = [
+  { id: 'claude-sonnet-4-6',       label: 'Claude Sonnet 4.6',   provider: 'claude',   icon: '/assets/claude-color.svg' },
+  { id: 'claude-opus-4-6',         label: 'Claude Opus 4.6',     provider: 'claude',   icon: '/assets/claude-color.svg' },
+  { id: 'claude-opus-4-7',         label: 'Claude Opus 4.7',     provider: 'claude',   icon: '/assets/claude-color.svg' },
+  { id: 'gemini-3.1-pro-preview',  label: 'Gemini 3.1 Pro',     provider: 'gemini',   icon: '/assets/gemini-color.svg' },
+  { id: 'gpt-5.5',                 label: 'GPT-5.5',            provider: 'gpt',      icon: '/assets/openai.svg' },
+  { id: 'deepseek-v4-pro',         label: 'DeepSeek V4 Pro',    provider: 'deepseek', icon: '/assets/deepseek-color.svg' },
+  { id: 'doubao-seed-2.0-pro',     label: 'Doubao Seed 2.0 Pro', provider: 'doubao',  icon: '/assets/doubao-color.svg' },
+];
+
+// v2: 只存 UI 偏好（messages 已迁到服务端 chats/）
+const CHAT_PREF_KEY = 'chat_v2_state';
+const CHAT_LEGACY_KEY = 'chat_v1_state';
+
+function loadChatPref() {
+  try {
+    const raw = localStorage.getItem(CHAT_PREF_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch { return null; }
+}
+function saveChatPref(state) {
+  try { localStorage.setItem(CHAT_PREF_KEY, JSON.stringify(state)); } catch {}
+}
+
+function chatGenId() {
+  if (window.crypto?.randomUUID) return window.crypto.randomUUID().replace(/-/g, '').slice(0, 24);
+  return 'c' + Math.random().toString(36).slice(2, 14) + Date.now().toString(36);
+}
+
+function chatDeriveTitle(messages) {
+  const firstUser = (messages || []).find(m => m.role === 'user');
+  if (!firstUser) return '新对话';
+  const text = (typeof firstUser.content === 'string' ? firstUser.content : '').trim();
+  return text.slice(0, 40) || '新对话';
+}
+
+function chatFormatTime(ts) {
+  if (!ts) return '';
+  const d = new Date(ts * 1000);
+  const diff = (Date.now() - d.getTime()) / 1000;
+  if (diff < 60) return '刚刚';
+  if (diff < 3600) return Math.floor(diff / 60) + ' 分钟前';
+  if (diff < 86400) return Math.floor(diff / 3600) + ' 小时前';
+  if (diff < 604800) return Math.floor(diff / 86400) + ' 天前';
+  return d.toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' });
+}
+
+function getModelMeta(modelId) {
+  return CHAT_MODELS.find(m => m.id === modelId) || CHAT_MODELS[0];
+}
+
+// 累加 OpenAI delta 到 message（同时支持 content 与 tool_calls，为 agent 预留）
+function applyChatDelta(msg, delta) {
+  if (!delta) return;
+  if (typeof delta.content === 'string' && delta.content) {
+    msg.content = (msg.content || '') + delta.content;
+  }
+  if (Array.isArray(delta.tool_calls)) {
+    msg.tool_calls = msg.tool_calls || [];
+    for (const tc of delta.tool_calls) {
+      const idx = tc.index ?? 0;
+      if (!msg.tool_calls[idx]) {
+        msg.tool_calls[idx] = { id: '', type: 'function', function: { name: '', arguments: '' } };
+      }
+      const slot = msg.tool_calls[idx];
+      if (tc.id) slot.id = tc.id;
+      if (tc.type) slot.type = tc.type;
+      if (tc.function) {
+        if (tc.function.name)      slot.function.name      = (slot.function.name || '') + tc.function.name;
+        if (tc.function.arguments) slot.function.arguments = (slot.function.arguments || '') + tc.function.arguments;
+      }
+    }
+  }
+}
+
+// Markdown 渲染（CDN marked + DOMPurify，未加载时回退转义文本）
+function renderChatMarkdown(text) {
+  if (!text) return '';
+  if (window.marked && window.DOMPurify) {
+    try {
+      const html = window.marked.parse(text, { breaks: true, gfm: true });
+      return window.DOMPurify.sanitize(html);
+    } catch (e) {
+      console.warn('[chat] markdown render failed', e);
+    }
+  }
+  return text.replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+}
+
+// SSE 行级解析器：从 fetch ReadableStream 拆出每个 data: payload
+async function* readChatSSE(resp) {
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) {
+      const tail = buf.trim();
+      if (tail.startsWith('data:')) {
+        const p = tail.slice(5).trim();
+        if (p) yield p;
+      }
+      return;
+    }
+    buf += decoder.decode(value, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (line.startsWith('data:')) {
+        const p = line.slice(5).trim();
+        if (p) yield p;
+      }
+    }
+  }
+}
+
+function ChatPanel() {
+  const pref = loadChatPref();
+  const [open, setOpen]         = useState(pref?.open ?? false);
+  const [model, setModel]       = useState(pref?.model || CHAT_MODELS[0].id);
+  const [activeId, setActiveId] = useState(pref?.activeId || null);
+
+  const [messages, setMessages] = useState([]);
+  const [sessions, setSessions] = useState([]);
+  const [view, setView]         = useState('chat');
+
+  const [input, setInput]       = useState('');
+  const [streaming, setStreaming] = useState(false);
+  const [error, setError]       = useState('');
+  const [sessionsLoading, setSessionsLoading] = useState(false);
+  const [modelDropOpen, setModelDropOpen] = useState(false);
+
+  const abortRef     = useRef(null);
+  const listRef      = useRef(null);
+  const hydratedRef  = useRef(false);
+  const modelDropRef = useRef(null);
+
+  // ------- UI 偏好持久化 -------
+  useEffect(() => {
+    saveChatPref({ open, model, activeId });
+  }, [open, model, activeId]);
+
+  // ------- 自动滚动 -------
+  useEffect(() => {
+    const el = listRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [messages, streaming, view]);
+
+  // ------- 点击外部关闭模型下拉 -------
+  useEffect(() => {
+    if (!modelDropOpen) return;
+    const handler = (e) => {
+      if (modelDropRef.current && !modelDropRef.current.contains(e.target)) setModelDropOpen(false);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [modelDropOpen]);
+
+  // ------- 拉取会话列表 -------
+  const refreshSessions = async () => {
+    setSessionsLoading(true);
+    try {
+      const r = await fetch('/api/chats');
+      const j = await r.json();
+      setSessions(Array.isArray(j.items) ? j.items : []);
+    } catch (e) {
+      console.warn('[chat] refreshSessions failed', e);
+    } finally {
+      setSessionsLoading(false);
+    }
+  };
+
+  // ------- 旧 localStorage 迁移（一次性） -------
+  const migrateLegacy = async () => {
+    let raw;
+    try { raw = localStorage.getItem(CHAT_LEGACY_KEY); } catch { return null; }
+    if (!raw) return null;
+    let legacy;
+    try { legacy = JSON.parse(raw); } catch { localStorage.removeItem(CHAT_LEGACY_KEY); return null; }
+    const oldMsgs = Array.isArray(legacy?.messages) ? legacy.messages : [];
+    if (oldMsgs.length === 0) { localStorage.removeItem(CHAT_LEGACY_KEY); return null; }
+    const id = chatGenId();
+    const payload = {
+      title: chatDeriveTitle(oldMsgs),
+      provider: legacy?.provider || getModelMeta(model).provider,
+      model: legacy?.model || model,
+      messages: oldMsgs,
+    };
+    try {
+      const r = await fetch(`/api/chats/${id}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (r.ok) {
+        try { localStorage.removeItem(CHAT_LEGACY_KEY); } catch {}
+        return id;
+      }
+    } catch (e) {
+      console.warn('[chat] legacy migrate failed', e);
+    }
+    return null;
+  };
+
+  // ------- 初始化：迁移 → 拉列表 → 恢复活动会话 -------
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const migratedId = await migrateLegacy();
+      await refreshSessions();
+      if (cancelled) return;
+
+      const restoreId = migratedId || activeId;
+      if (restoreId) {
+        try {
+          const r = await fetch(`/api/chats/${restoreId}`);
+          if (r.ok) {
+            const data = await r.json();
+            if (!cancelled) {
+              setMessages(Array.isArray(data.messages) ? data.messages : []);
+              if (data.model) setModel(data.model);
+              setActiveId(restoreId);
+            }
+          } else if (r.status === 404) {
+            if (!cancelled) setActiveId(null);
+          }
+        } catch (e) {
+          console.warn('[chat] restore failed', e);
+        }
+      }
+      hydratedRef.current = true;
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ------- 保存当前会话到服务端 -------
+  const persistActive = async (idArg, msgsArg, modelArg) => {
+    const id     = idArg     ?? activeId;
+    const msgs   = msgsArg   ?? messages;
+    const mdl    = modelArg  ?? model;
+    if (!id || msgs.length === 0) return;
+    try {
+      const r = await fetch(`/api/chats/${id}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: chatDeriveTitle(msgs),
+          provider: getModelMeta(mdl).provider,
+          model: mdl,
+          messages: msgs,
+        }),
+      });
+      if (r.ok) refreshSessions();
+    } catch (e) {
+      console.warn('[chat] persist failed', e);
+    }
+  };
+
+  const currentModel = getModelMeta(model);
+
+  // ------- 新建对话 -------
+  const newSession = () => {
+    if (streaming) return;
+    setActiveId(null);
+    setMessages([]);
+    setError('');
+    setView('chat');
+  };
+
+  // ------- 切换会话 -------
+  const selectSession = async (id) => {
+    if (streaming) return;
+    if (id === activeId) { setView('chat'); return; }
+    try {
+      const r = await fetch(`/api/chats/${id}`);
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.json();
+      setActiveId(id);
+      setMessages(Array.isArray(data.messages) ? data.messages : []);
+      if (data.model) setModel(data.model);
+      setError('');
+      setView('chat');
+    } catch (e) {
+      console.warn('[chat] selectSession failed', e);
+      setError('加载会话失败: ' + e.message);
+    }
+  };
+
+  // ------- 删除会话 -------
+  const deleteSession = async (id, e) => {
+    e?.stopPropagation?.();
+    if (!confirm('删除这个对话？此操作不可恢复。')) return;
+    try {
+      await fetch(`/api/chats/${id}`, { method: 'DELETE' });
+      if (id === activeId) {
+        setActiveId(null);
+        setMessages([]);
+      }
+      refreshSessions();
+    } catch (e2) {
+      console.warn('[chat] delete failed', e2);
+    }
+  };
+
+  // ------- 发送消息 -------
+  const sendMessage = async () => {
+    const text = input.trim();
+    if (!text || streaming) return;
+
+    let sid = activeId;
+    if (!sid) { sid = chatGenId(); setActiveId(sid); }
+
+    const userMsg = { role: 'user', content: text };
+    const placeholderMsg = { role: 'assistant', content: '' };
+    const baseMsgs = [...messages, userMsg];
+    setMessages([...baseMsgs, placeholderMsg]);
+    setInput('');
+    setStreaming(true);
+    setError('');
+
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+
+    const payloadMessages = baseMsgs.map(m => {
+      const out = { role: m.role, content: m.content };
+      if (m.tool_calls)    out.tool_calls    = m.tool_calls;
+      if (m.tool_call_id)  out.tool_call_id  = m.tool_call_id;
+      if (m.name)          out.name          = m.name;
+      return out;
+    });
+
+    let working = { role: 'assistant', content: '' };
+    let finalMsgs = null;
+
+    try {
+      const resp = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model, messages: payloadMessages }),
+        signal: ctrl.signal,
+      });
+
+      if (!resp.ok) {
+        let detail = '';
+        try { const j = await resp.json(); detail = j.error?.message || JSON.stringify(j); }
+        catch { detail = await resp.text().catch(() => ''); }
+        throw new Error(`HTTP ${resp.status}: ${detail.slice(0, 300)}`);
+      }
+
+      for await (const payload of readChatSSE(resp)) {
+        if (payload === '[DONE]') break;
+        let chunk;
+        try { chunk = JSON.parse(payload); } catch { continue; }
+        const choice = chunk.choices?.[0];
+        if (!choice) continue;
+        applyChatDelta(working, choice.delta || {});
+        const snapshot = { ...working, tool_calls: working.tool_calls ? [...working.tool_calls] : undefined };
+        setMessages(prev => {
+          const arr = [...prev];
+          arr[arr.length - 1] = snapshot;
+          return arr;
+        });
+      }
+
+      finalMsgs = [...baseMsgs, { ...working, tool_calls: working.tool_calls ? [...working.tool_calls] : undefined }];
+    } catch (e) {
+      if (e.name === 'AbortError') {
+        const stopped = { ...working, content: (working.content || '') + '\n\n_（已停止）_' };
+        setMessages(prev => {
+          const arr = [...prev];
+          arr[arr.length - 1] = stopped;
+          return arr;
+        });
+        finalMsgs = [...baseMsgs, stopped];
+      } else {
+        console.error('[chat] error', e);
+        setError(e.message || '请求失败');
+        setMessages(prev => prev.slice(0, -1)); // 移除占位 assistant
+        // 即便失败也持久化 user message，不让用户白打一遍
+        finalMsgs = baseMsgs;
+      }
+    } finally {
+      setStreaming(false);
+      abortRef.current = null;
+      if (finalMsgs && finalMsgs.length > 0) {
+        persistActive(sid, finalMsgs, model);
+      }
+    }
+  };
+
+  const stopStreaming = () => { if (abortRef.current) abortRef.current.abort(); };
+
+  const onInputKeyDown = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+      e.preventDefault();
+      sendMessage();
+    }
+  };
+
+  // ------- 折叠态 -------
+  if (!open) {
+    return (
+      <button className="chat-fab" onClick={() => setOpen(true)} title="打开对话">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+        </svg>
+      </button>
+    );
+  }
+
+  // ------- 历史视图 -------
+  if (view === 'history') {
+    return (
+      <div className="chat-panel">
+        <div className="chat-header">
+          <div className="chat-header-title">
+            <button className="chat-icon-btn" onClick={() => setView('chat')} title="返回">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <line x1="19" y1="12" x2="5" y2="12" /><polyline points="12 19 5 12 12 5" />
+              </svg>
+            </button>
+            <span className="chat-history-title">对话列表</span>
+            {sessionsLoading && <span className="chat-loading-tag">加载中…</span>}
+          </div>
+          <div className="chat-header-actions">
+            <button className="chat-icon-btn" onClick={() => { newSession(); }} disabled={streaming} title="新建对话">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" />
+              </svg>
+            </button>
+            <button className="chat-icon-btn" onClick={() => setOpen(false)} title="收起">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <line x1="6" y1="6" x2="18" y2="18" /><line x1="6" y1="18" x2="18" y2="6" />
+              </svg>
+            </button>
+          </div>
+        </div>
+        <div className="chat-history-list">
+          {sessions.length === 0 && !sessionsLoading && (
+            <div className="chat-empty">
+              <div className="chat-empty-title">还没有对话</div>
+              <div className="chat-empty-hint">点击右上角 + 开始第一个对话</div>
+            </div>
+          )}
+          {sessions.map(s => (
+            <div
+              key={s.id}
+              className={`chat-history-item${s.id === activeId ? ' chat-history-item-active' : ''}`}
+              onClick={() => selectSession(s.id)}
+            >
+              <div className="chat-history-item-main">
+                <div className="chat-history-item-title">{s.title || '新对话'}</div>
+                <div className="chat-history-item-meta">
+                  <span className="chat-history-item-model">{s.model || ''}</span>
+                  <span className="chat-history-item-dot">·</span>
+                  <span>{chatFormatTime(s.updated_at)}</span>
+                  <span className="chat-history-item-dot">·</span>
+                  <span>{s.message_count || 0} 条</span>
+                </div>
+              </div>
+              <button className="chat-icon-btn chat-history-item-del" onClick={e => deleteSession(s.id, e)} title="删除">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="3 6 5 6 21 6" />
+                  <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+                </svg>
+              </button>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  // ------- 对话视图 -------
+  return (
+    <div className="chat-panel">
+      <div className="chat-header">
+        <div className="chat-header-title">
+          <span className={`chat-dot${streaming ? ' chat-dot-busy' : ''}`}></span>
+          <div className="chat-model-picker" ref={modelDropRef}>
+            <button className="chat-model-trigger" onClick={() => !streaming && setModelDropOpen(!modelDropOpen)} disabled={streaming}>
+              <img className="chat-model-icon" src={currentModel.icon} alt="" width="16" height="16" />
+              <span className="chat-model-trigger-label">{currentModel.label}</span>
+              <svg className="chat-model-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><polyline points="6 9 12 15 18 9" /></svg>
+            </button>
+            {modelDropOpen && (
+              <div className="chat-model-dropdown">
+                {CHAT_MODELS.map(m => (
+                  <button
+                    key={m.id}
+                    className={`chat-model-option${m.id === model ? ' chat-model-option-active' : ''}`}
+                    onClick={() => { setModel(m.id); setModelDropOpen(false); }}
+                  >
+                    <img className="chat-model-icon" src={m.icon} alt="" width="16" height="16" />
+                    <span className="chat-model-option-label">{m.label}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+        <div className="chat-header-actions">
+          <button className="chat-icon-btn" onClick={() => { setView('history'); refreshSessions(); }} title="历史对话">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="3" y1="6" x2="21" y2="6" /><line x1="3" y1="12" x2="21" y2="12" /><line x1="3" y1="18" x2="21" y2="18" />
+            </svg>
+          </button>
+          <button className="chat-icon-btn" onClick={newSession} disabled={streaming} title="新建对话">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" />
+            </svg>
+          </button>
+          <button className="chat-icon-btn" onClick={() => setOpen(false)} title="收起">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="6" y1="6" x2="18" y2="18" /><line x1="6" y1="18" x2="18" y2="6" />
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <div className="chat-messages" ref={listRef}>
+        {messages.length === 0 && (
+          <div className="chat-empty">
+            <div className="chat-empty-title">开始对话</div>
+            <div className="chat-empty-hint">使用 {currentModel.label}<br/>与生图功能并行，互不影响</div>
+          </div>
+        )}
+        {messages.map((m, i) => {
+          const isLast = i === messages.length - 1;
+          const showTyping = streaming && isLast && !m.content && !(m.tool_calls && m.tool_calls.length);
+          return (
+            <div key={i} className={`chat-msg chat-msg-${m.role}`}>
+              <div className="chat-msg-role">
+                {m.role === 'user' ? '你'
+                  : m.role === 'assistant' ? currentModel.label
+                  : m.role === 'tool' ? `工具结果${m.name ? `（${m.name}）` : ''}`
+                  : m.role}
+              </div>
+              {showTyping ? (
+                <div className="chat-msg-body">
+                  <span className="chat-typing-dot"></span>
+                  <span className="chat-typing-dot"></span>
+                  <span className="chat-typing-dot"></span>
+                </div>
+              ) : (
+                <div className="chat-msg-body" dangerouslySetInnerHTML={{ __html: renderChatMarkdown(m.content) }} />
+              )}
+              {m.tool_calls && m.tool_calls.length > 0 && (
+                <div className="chat-msg-toolcalls">
+                  {m.tool_calls.map((tc, j) => (
+                    <div key={j} className="chat-toolcall">
+                      <span className="chat-toolcall-name">{tc.function?.name || '(unnamed)'}</span>
+                      {tc.function?.arguments ? `(${tc.function.arguments})` : '()'}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
+        {error && <div className="chat-error">⚠ {error}</div>}
+      </div>
+
+      <div className="chat-input-wrap">
+        <textarea
+          className="chat-input"
+          placeholder="输入消息，Enter 发送，Shift+Enter 换行"
+          rows={2}
+          value={input}
+          onChange={e => setInput(e.target.value)}
+          onKeyDown={onInputKeyDown}
+          disabled={streaming}
+        />
+        {streaming ? (
+          <button className="chat-send chat-send-stop" onClick={stopStreaming} title="停止生成">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2" /></svg>
+          </button>
+        ) : (
+          <button className="chat-send" onClick={sendMessage} disabled={!input.trim()} title="发送 (Enter)">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="12" y1="19" x2="12" y2="5" />
+              <polyline points="5 12 12 5 19 12" />
+            </svg>
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <React.Fragment>
+    <App />
+    <ChatPanel />
+  </React.Fragment>
+);
